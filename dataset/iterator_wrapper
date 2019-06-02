@@ -1,0 +1,78 @@
+"""For loading data into Faster-RCNN models."""
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+
+import collections
+import tensorflow as tf
+
+__all__ = ["get_infer_iterator_wrapper", "get_iterator_wrapper"]
+
+
+class IteratorWrapper(
+    collections.namedtuple("IteratorWrapper",
+                           ("initializer", "images_info", "bboxes_info"))):
+    pass
+
+
+def get_iterator_wrapper(src_dataset,
+                         batch_size,
+                         image_format="jpeg",
+                         num_parallel_calls=4,
+                         output_buffer_size=10,
+                         image_feature="image/data",
+                         height_feature="image/height",
+                         width_feature="image/width",
+                         cate_feature="bbox/cate_id",
+                         overlap_feature="bbox/overlap",
+                         coord_feature="bbox/coord"):
+    def get_feature_description(image_feature_, height_feature_, width_feature_,
+                                cate_feature_, overlap_feature_, coord_feature_):
+        context_features_proto = {
+            image_feature_: tf.FixedLenFeature([], dtype=tf.string),
+            height_feature_: tf.FixedLenFeature([], dtype=tf.int64),
+            width_feature_: tf.FixedLenFeature([], dtype=tf.int64),
+            cate_feature_: tf.FixedLenFeature([], dtype=tf.int64),
+            overlap_feature_: tf.FixedLenFeature([], dtype=tf.float32)
+        }
+        sequence_features_proto = {
+            coord_feature_: tf.FixedLenSequenceFeature([], dtype=tf.float32)
+        }
+        return context_features_proto, sequence_features_proto
+    context_features, sequence_features = get_feature_description(
+        image_feature, height_feature, width_feature,
+        cate_feature, overlap_feature, coord_feature)
+    # fetch context and sequence from record
+    src_dataset = src_dataset.map(
+        lambda x: (tf.parse_single_sequence_example(
+            x, context_features, sequence_features)),
+        num_parallel_calls=num_parallel_calls).prefetch(output_buffer_size)
+    # Data argument or normalize?
+    # fetch image data, height, width, bbox category, overlap, coordinate from record
+    src_dataset = src_dataset.map(
+        lambda context, sequence: (
+            context[image_feature], context[height_feature], context[width_feature],
+            tf.to_int32(context[cate_feature]), context[overlap_feature], sequence[coord_feature]),
+        num_parallel_calls=num_parallel_calls).prefetch(output_buffer_size)
+    src_dataset = src_dataset.batch(batch_size)
+    batched_iter = src_dataset.make_initializable_iterator()
+    (img_data, img_height, img_width, bbox_cate, bbox_overlap, bbox_coord) = batched_iter.get_next()
+    return IteratorWrapper(
+        initializer=batched_iter.initializer,
+        images_info=(img_data, img_height, img_width),
+        bboxes_info=(bbox_cate, bbox_overlap, bbox_coord))
+
+
+def get_infer_iterator_wrapper(src_dataset,
+                               batch_size,
+                               image_format="jpeg"):
+    # Data argument or normalize?
+    # batch
+    batched_dataset = src_dataset.batch(batch_size)
+    batched_iter = batched_dataset.make_initializable_iterator()
+    img_data, img_height, img_width = batched_iter.get_next()
+    return IteratorWrapper(
+        initializer=batched_iter.initializer,
+        images_info=(img_data, img_height, img_width),
+        bboxes_info=None)
