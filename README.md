@@ -15,3 +15,14 @@ VGG_16
 ResNetV1_50
 Inception_V3 unable to work temporarily,cause Tensorflow's avg pooling method don't supoort dynamic ksize and stride temporarily,
 see Issue https://github.com/tensorflow/tensorflow/issues/26961
+
+# Environment
+tensorflow-gpu: 1.13.1
+CUDA: 10.0.130
+CUDNN: 7.3.1
+GPU: RTX-2070
+
+# This model is unable to work now,cause 
+UnknownError (see above for traceback): Failed to get convolution algorithm. This is probably because cuDNN failed to initialize, so try looking to see if a warning log message was printed above.
+	 [[node vgg_16/conv1/conv1_1/Conv2D (defined at F:\Pycharm\PyCharm Community Edition 2018.3.5\workspace\Detection\models\vgg_16.py:20) ]]
+
