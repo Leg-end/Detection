@@ -1,4 +1,4 @@
-"""This is a base library for translate MCOCO-dataset-2014 into TFRecord"""
+"""This is a base library for translate MCOCO-dataset into TFRecord"""
 import tensorflow as tf
 import json
 import os
@@ -16,13 +16,13 @@ tf.flags.DEFINE_string("train_image_dir", "D:/dataset/Images/COCO/train2014/",
                        "Training image directory.")
 tf.flags.DEFINE_string("val_image_dir", "D:/dataset/Images/COCO/val2014/",
                        "Validation image directory.")
+tf.flags.DEFINE_string("category_file", "D:/Detection/dataset/COCO/id_to_category.txt", "Category file")
+tf.flags.DEFINE_string("train_instance_file", "D:/Detection/dataset/COCO/instances_train2014.json",
+                       "Training boxs JSON file.")
+tf.flags.DEFINE_string("val_boxs_file", "D:/Detection/dataset/COCO/instances_val2014.json",
+                       "Validation boxs JSON file.")
 
-tf.flags.DEFINE_string("train_instance_file", "D:/dataset/Detection/COCO/instances_train2014.json",
-                       "Training captions JSON file.")
-tf.flags.DEFINE_string("val_captions_file", "D:/dataset/Detection/COCO/instances_val2014.json",
-                       "Validation captions JSON file.")
-
-tf.flags.DEFINE_string("output_dir", "D:/dataset/Detection/COCO_tfrecord/", "Output data directory.")
+tf.flags.DEFINE_string("output_dir", "D:/Detection/dataset/COCO_tfrecord/", "Output data directory.")
 
 tf.flags.DEFINE_integer("train_shards", 256,
                         "Number of shards in training TFRecord files.")
@@ -36,7 +36,7 @@ tf.flags.DEFINE_integer("num_threads", 8,
 
 FLAGS = tf.flags.FLAGS
 ImageMetadata = namedtuple("ImageMetadata",
-                           ["image_id", "height", "width", "path", "labels"])
+                           ["image_id", "height", "width", "path", "bboxes"])
 
 
 class ImageDecoder(object):
@@ -92,31 +92,34 @@ def _load_cls_bboxes(annotations):
     for entity in annotations:
         image_id = entity["image_id"]
         cls_id = entity["category_id"]
-        bbox = entity["bbox"]
-        overlap = 1.0
-        # If crowd is 1, means this bbox will be excluded during training
-        if entity["iscrowd"]:
-            overlap = -1.0
-        id_to_cls_bboxes.setdefault(image_id, [])
-        id_to_cls_bboxes[image_id].append([cls_id, overlap, bbox])
-
+        bbox = _transform_bbox(entity["bbox"], cls_id)
+        # [[x_left], [y_top], [x_right], [y_bottom], [category_id]]
+        id_to_cls_bboxes.setdefault(image_id, [[], [], [], [], []])
+        for i, item in enumerate(id_to_cls_bboxes[image_id]):
+            item.append(bbox[i])
     return id_to_cls_bboxes
 
 
-def _valid_bbox(label, height, width):
+def _transform_bbox(bbox, cls_id):
     """
     Validate that whether the box is out of the range of image
-    :param label: [category_id, overlap, bbox]
-    :param height: image height
-    :param width: image width
-    :return: [category_id, overlap, x_left, y_top, x_right, y_bottom]
+    :param bbox: bounding box [x_left, y_right, width, height]
+    :param cls_id: bounding box's category id
+    :return: [x_left, y_top, x_right, y_bottom, category_id]
     """
-    bbox = label[2]
-    x_l = max(0, bbox[0])
-    y_t = max(0, bbox[1])
-    x_r = min(width-1, max(0, bbox[2]))
-    y_b = min(height-1, max(0, bbox[3]))
-    return [label[0], label[1], x_l, y_t, x_r, y_b]
+    x_l = bbox[0]
+    y_t = bbox[1]
+    x_r = x_l+bbox[2]
+    y_b = y_t+bbox[3]
+    return [x_l, y_t, x_r, y_b, cls_id]
+
+
+def _valid_bbox(bbox, height, width):
+    bbox[0] = max(0, bbox[0])
+    bbox[1] = max(0, bbox[1])
+    bbox[2] = min(bbox[2], width-1)
+    bbox[3] = min(bbox[3], height-1)
+    return bbox
 
 
 def _to_sequence_example(image, decoder):
@@ -132,19 +135,18 @@ def _to_sequence_example(image, decoder):
         decoder.decode_jpeg(encoded_image)
     except (tf.errors.InvalidArgumentError, AssertionError):
         print("Skipping file with invalid JPEG data: %s" % image.path)
-    assert len(image.labels) == 6
-    labels = image.labels
+    bboxes = image.bboxes
     context = tf.train.Features(feature={
         "image/image_id": _int64_feature(image.image_id),
-        "image/height": _int64_feature(image.height),
-        "image/width": _int64_feature(image.width),
-        "image/data": _bytes_feature(encoded_image),
-        "bbox/cate_id": _int64_feature(labels[0]),
-        "bbox/overlap": _float_feature(labels[1]),
+        "image/data": _bytes_feature(encoded_image)
     })
-
     feature_lists = tf.train.FeatureLists(feature_list={
-        "bbox/coord": _float_feature_list(labels[2:]),
+        "bbox/locations/x_l": _float_feature_list(bboxes[0]),
+        "bbox/locations/y_t": _float_feature_list(bboxes[1]),
+        "bbox/locations/x_r": _float_feature_list(bboxes[2]),
+        "bbox/locations/y_b": _float_feature_list(bboxes[3]),
+        "bbox/categories": _int64_feature_list(bboxes[4]),
+        "image/size": _int64_feature_list([image.height, image.width, 3])
     })
     sequence_example = tf.train.SequenceExample(
         context=context, feature_lists=feature_lists)
@@ -152,7 +154,7 @@ def _to_sequence_example(image, decoder):
 
 
 def _process_image_files(thread_index, ranges, name, images,
-                         decoder, num_shards):
+                         decoder, num_shards, out_dir):
     # Each thread produces N shards where N = num_shards / num_threads. For
     # instance, if num_shards = 128, and num_threads = 2, then the first thread
     # would produce shards [0, 64).
@@ -169,14 +171,13 @@ def _process_image_files(thread_index, ranges, name, images,
         # Generate a sharded version of the file name, e.g. 'train-00002-of-00010'
         shard = thread_index * num_shards_per_batch + s
         output_filename = "%s-%.5d-of-%.5d" % (name, shard, num_shards)
-        output_file = os.path.join(FLAGS.output_dir, name, output_filename)
+        output_file = os.path.join(out_dir, output_filename)
         writer = tf.python_io.TFRecordWriter(output_file)
 
         shard_counter = 0
         images_in_shard = np.arange(shard_ranges[s], shard_ranges[s + 1], dtype=int)
         for i in images_in_shard:
             image = images[i]
-
             sequence_example = _to_sequence_example(image, decoder)
             if sequence_example is not None:
                 writer.write(sequence_example.SerializeToString())
@@ -189,10 +190,10 @@ def _process_image_files(thread_index, ranges, name, images,
                 sys.stdout.flush()
 
         writer.close()
-        print("%s [thread %d]: Wrote %d image-caption pairs to %s" %
+        print("%s [thread %d]: Wrote %d image-box pairs to %s" %
               (datetime.now(), thread_index, shard_counter, output_file))
         sys.stdout.flush()
-    print("%s [thread %d]: Wrote %d image-caption pairs to %d shards." %
+    print("%s [thread %d]: Wrote %d image-box pairs to %d shards." %
           (datetime.now(), thread_index, counter, num_shards_per_batch))
     sys.stdout.flush()
 
@@ -205,16 +206,19 @@ def process_data(name, images, num_shards):
     :param num_shards: Integer number of shards for the output files.
     :return: TFRecord dataset
     """
-    # Break up each image into a separate entity for each caption.
-    images = [ImageMetadata(image.image_id, image.height, image.width, image.path, label)
-              for image in images for label in image.labels]
+    # No need to break up each image into a separate entity for each bbox.
+    # Cause each bbox in the same image can share computation of convolution
+    # images = [ImageMetadata(image.image_id, image.height, image.width, image.path, label)
+    # for image in images for label in image.labels]
     count = len(images)
     if count < num_shards:
         num_shards = count
     # Shuffle the ordering of images. Make the randomization repeatable
     random.seed(12345)
     random.shuffle(images)
-
+    out_dir = os.path.join(FLAGS.output_dir, name)
+    if not tf.gfile.Exists(out_dir):
+        tf.gfile.MakeDirs(out_dir)
     # Break the images into num_threads batches. Batch i is defined as
     # images[ranges[i][0]:ranges[i][1]].
     num_threads = min(num_shards, FLAGS.num_threads)
@@ -232,41 +236,53 @@ def process_data(name, images, num_shards):
     # Launch a thread for each batch.
     print("Launch %d threads for spacings: %s" % (num_threads, ranges))
     for thread_index in range(len(ranges)):
-        args = (thread_index, ranges, name, images, decoder, num_shards)
+        args = (thread_index, ranges, name, images, decoder, num_shards, out_dir)
         t = threading.Thread(target=_process_image_files, args=args)
         t.start()
         threads.append(t)
         # Wait for all the threads to terminate.
     coord.join(threads)
-    print("%s: Finished processing all %d image-caption pairs in data set '%s'." %
+    print("%s: Finished processing all %d image-box pairs in data set '%s'." %
           (datetime.now(), len(images), name))
+
+
+def debug(id_to_img_info, id_to_bboxes):
+    arg1 = [entity[0] for entity in id_to_img_info]
+    arg2 = list(id_to_bboxes.keys())
+    for v in arg2:
+        arg1.remove(v)
+    print(arg1)
 
 
 def load_and_process_metadata(desc_file, img_dir):
     with tf.gfile.FastGFile(desc_file, "r") as f:
         desc_data = json.load(f)
     # Extract filename of image
+
     id_to_img_info = [(entity["id"], entity["file_name"], entity["height"], entity["width"])
                       for entity in desc_data["images"]]
     # Extract the target label, each image_id may associated with multiple labels
     annotations = desc_data["annotations"]
-    id_to_labels = _load_cls_bboxes(annotations)
-    assert len(id_to_img_info) == len(id_to_labels)
-    assert set([entity[0] for entity in id_to_img_info]) == set(id_to_labels.keys())
+    id_to_bboxes = _load_cls_bboxes(annotations)
+    # debug(id_to_img_info, id_to_bboxes)
     print("Loaded detection metadata for %d images from %s"
           % (len(id_to_img_info), desc_file))
-
     # Process the labels and combine the data into a list of ImageMetadata
-    print("Processing labels")
+    print("Processing bboxes")
     image_metadata = []
-    num_labels = 0
+    num_bbox = 0
+    skip_num = 0
     for image_id, base_filename, height, width in id_to_img_info:
+        if image_id in id_to_bboxes:
+            bboxes = id_to_bboxes[image_id]
+        else:
+            skip_num += 1
+            continue
         path = os.path.join(img_dir, base_filename)
-        labels = id_to_labels[image_id]
-        labels = [_valid_bbox(label, height, width) for label in labels]
-        image_metadata.append(ImageMetadata(image_id, height, width, path, labels))
-        num_labels += len(labels)
-    print("Finished processing %d captions for %d images in %s" %
-          (num_labels, len(id_to_img_info), desc_file))
+        image_metadata.append(ImageMetadata(image_id, height, width, path, bboxes))
+        num_bbox += len(bboxes)
+    assert (len(id_to_img_info) - skip_num) == len(id_to_bboxes)
+    print("Finished processing %d boxs for %d images in %s,"
+          " skip %d images which have no box contained" %
+          (num_bbox, len(id_to_img_info), desc_file, skip_num))
     return image_metadata
-
