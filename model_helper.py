@@ -6,17 +6,19 @@ from __future__ import print_function
 import collections
 import os
 import time
-import numpy as np
-import six
 import tensorflow as tf
 from tensorflow.python.ops import gen_nn_ops
 from utils import proposal_util
 from utils import anchor_util
-from dataset import build_tfrecord
+from utils import misc_util as misc
 from dataset import iterator_wrapper
 
 
-__all__ = ["get_initializer", "get_device_str", "generate_img_anchors"]
+__all__ = ["get_initializer", "get_device_str", "generate_img_anchors",
+           "restore_pre_model", "reshape_for_forward_pairs",
+           "create_or_load_model", "load_model", "crop_resize_pooling",
+           "spatial_pyramid_pooling", "sample_rois_from_anchors",
+           "create_train_model", "create_infer_model", "create_eval_model"]
 
 
 def get_initializer(init_op, seed=None, init_weight=None):
@@ -43,13 +45,18 @@ def get_device_str(device_id, num_gpus):
     return device_str_output
 
 
-def generate_img_anchors(im_info, feat_stride=16,
+def generate_img_anchors(images_info, feat_stride=16,
                          ratios=tf.constant([0.5, 1.0, 2.0]),
                          scales=tf.multiply(tf.range(3, 6), 2)):
-    height = tf.to_int32(tf.ceil(tf.divide(im_info[0], tf.to_float(feat_stride))))
-    width = tf.to_int32(tf.ceil(tf.divide(im_info[1], tf.to_float(feat_stride))))
-    anchors, count = anchor_util.generate_image_anchors(height, width, ratios=ratios, scales=scales)
-    return anchors, count
+    with tf.name_scope("generate_img_anchors"):
+        height = tf.to_int32(tf.ceil(tf.divide(tf.to_float(images_info[0]), tf.to_float(feat_stride))))
+        width = tf.to_int32(tf.ceil(tf.divide(tf.to_float(images_info[1]), tf.to_float(feat_stride))))
+        # When using padded_batch so that can we use height[0], width[0] directly,
+        # or will cause different num of anchors in each batch
+        anchors, all_count = anchor_util.generate_image_anchors(height, width, ratios=ratios, scales=scales)
+        # todo Tile up to [batch size, all_count, 4] when set batch_size greater than 1
+        # anchors = tf.tile(tf.expand_dims(anchors, dim=0), multiples=[tf.shape(images_info)[0], 1, 1])
+    return anchors, all_count
 
 
 def reshape_for_forward_pairs(inputs, num_dim, name="reshape_forward_pairs"):
@@ -85,8 +92,8 @@ def reshape_for_forward_pairs(inputs, num_dim, name="reshape_forward_pairs"):
     :param name: op name
     :return: A reshaped Tensor which has a fixed channel specified by [num_dim]
     """
-    shape = tf.shape(inputs)
     with tf.name_scope(name):
+        shape = tf.shape(inputs)
         outputs = tf.transpose(inputs, perm=[0, 3, 1, 2])
         # Force it to have 2 channels
         outputs = tf.reshape(outputs, shape=tf.concat(
@@ -101,12 +108,51 @@ def sample_rois_from_anchors(cls_scores,
                              im_info,
                              anchors,
                              count,
-                             strategy="nms",
-                             name="rois"):
+                             name="sample_rois"):
     with tf.name_scope(name):
         rois, scores = proposal_util.sample_regions(cls_scores, bbox_deltas, im_info,
-                                                    anchors, count, strategy=strategy)
+                                                    anchors, count)
     return rois, scores
+
+
+def pack_anchor_info(im_info,
+                     anchors,
+                     ori_anchor_count,
+                     bbox_targets,
+                     anchor_scores):
+    """
+    Fill bbox label and class_label(positive and negative, self-supervise) into anchor_info
+    :param im_info: image property:[height, width, channel]
+    :param anchors: all anchors on image
+    :param ori_anchor_count: original anchor's count
+    :param bbox_targets: target bbox
+    :param anchor_scores: calculated by rpn's classification layer, scores of (anchors)bboxes
+    :return: a dict with execution info inside and anchor_labels
+    """
+    with tf.name_scope("pack_anchor_info"):
+        class_labels, bbox_targets, in_weights, out_weights = anchor_util.generate_anchor_targets(
+            anchor_scores, anchors, bbox_targets, im_info, ori_anchor_count)
+        anchor_info = dict()
+        misc.append_params(anchor_info,
+                           bbox_labels=bbox_targets, class_labels=tf.to_int32(class_labels),
+                           out_weights=out_weights, in_weights=in_weights)
+    return anchor_info
+
+
+def pack_proposal_info(rpn_labels,
+                       rois,
+                       bbox_scores,
+                       bbox_targets,
+                       num_class):
+    with tf.name_scope("pack_proposal_info"):
+        with tf.control_dependencies([rpn_labels]):
+            labels, rois, roi_scores, bbox_targets, in_weights, out_weights = proposal_util.generate_proposal_target(
+                rois, bbox_scores, bbox_targets, num_class)
+        proposal_info = dict()
+        misc.append_params(proposal_info, class_labels=tf.to_int32(labels),
+                           bbox_labels=bbox_targets, rois=rois,
+                           in_weights=in_weights, out_weights=out_weights)
+    return proposal_info, rois, roi_scores
 
 
 def spatial_pyramid_pooling(bin_size_list, inputs, rois, feat_stride, padding="VALID"):
@@ -120,12 +166,12 @@ def spatial_pyramid_pooling(bin_size_list, inputs, rois, feat_stride, padding="V
     :param rois: batch indices, regions of interest on images
     :param feat_stride: convolution stride on last convolutional layer
     :param padding: default same
-    :return: 3-D tensor of shape [batch, num_roi, out_size] which has same type as inputs and whose
+    :return: 2-D tensor of shape [batch, vector_size] which has same type as inputs and whose
     length fit the input size of next fc
     """
     # Map images' rois to feature maps
-
-    bboxes = proposal_util.map_rois_to_feature(tf.shape(inputs), rois[:, 1:], feat_stride)
+    bboxes = tf.stop_gradient(proposal_util.map_rois_to_feature(
+        tf.shape(inputs), rois[:, 1:], feat_stride))
     outputs = []
     # Crop all the rois in feature maps
     crops = tf.image.crop_to_bounding_box(inputs, bboxes)
@@ -137,38 +183,48 @@ def spatial_pyramid_pooling(bin_size_list, inputs, rois, feat_stride, padding="V
             win_w = shape[2] / bin_size
             pool_size = [1, tf.to_int32(tf.ceil(win_h)), tf.to_int32(tf.ceil(win_w)), 1]
             pool_stride = [1, tf.to_int32(tf.floor(win_h)), tf.to_int32(tf.floor(win_w)), 1]
-            # result = tf.layers.max_pooling2d(inputs, pool_size, pool_stride, padding=padding)
             # Original max_pooling function does not support tensor-like pool_size and pool_stride
             # One solution is that max_pooling can be replaced by reduce_max after some transformation
-            # for inputs(https://github.com/Sarthak-02/keras-spp/blob/master/SpatialPyramidPooling.py),
+            # on inputs(https://github.com/Sarthak-02/keras-spp/blob/master/SpatialPyramidPooling.py),
             # another solution is reconstructing max_pooling, already done by
             # [https://github.com/yongtang, https://github.com/tensorflow/tensorflow/pull/11875]
             results = gen_nn_ops.max_pool_v2(inputs, pool_size, pool_stride, padding=padding)
-            roi_pools = tf.expand_dims(tf.concat(roi_pools.append(tf.reshape(
-                results, shape=[shape[0], -1])), axis=1), axis=1)
+            roi_pools = tf.concat(roi_pools.append(tf.layers.flatten(results)), axis=1)
         outputs.append(roi_pools)
     return tf.concat(outputs, axis=1)
 
 
-def crop_resize_pooling(inputs, rois, feat_stride, unify_size, padding='SAME'):
+def crop_resize_pooling(inputs, rois, feat_stride, pool_size,
+                        max_pool=True, padding='SAME', flatten=True):
     """
     Crop regions from feature map according to rois, then resize them to
     the same size, this will get same size of pooling feature after pooling
     :param inputs: output from final convolution-layer
     :param rois: batch indices, regions of interest on images
     :param feat_stride: convolution stride on last convolutional layer
-    :param unify_size: unify size for resizing
+    :param pool_size: unify size after pooling
     :param padding: default same
-    :return: 3-D tensor of shape [batch, num_roi, out_size] which has same type as inputs and whose
+    :param max_pool: If true ,do max pooling, specify in resnet
+    :param flatten: If true, do flatten, specify in resnet
+    :return: 2-D tensor of shape [batch, vector_size] which has same type as inputs and whose
     length fit the input size of next fc
     """
     shape = tf.shape(inputs)
     batch_inds = tf.squeeze(tf.slice(rois, [0, 0], [-1, 1]), axis=1)
     bboxes = tf.stop_gradient(proposal_util.map_rois_to_feature(shape, rois[:, 1:], feat_stride))
-    crops = tf.image.crop_and_resize(inputs, bboxes, tf.to_int32(batch_inds), unify_size)
-    return tf.reshape(tf.nn.max_pool(crops, ksize=[1, 2, 2, 1], strides=[1, 1, 1, 1],
-                                     padding=padding, name="max_pool"),
-                      shape=[shape[0], tf.shape(rois)[0], -1])
+    if max_pool:
+        pool_size = pool_size*2
+        crops = tf.image.crop_and_resize(inputs, bboxes, tf.to_int32(batch_inds),
+                                        [pool_size, pool_size], name="crops")
+        crops = tf.nn.max_pool(crops, ksize=[1, 2, 2, 1], strides=[1, 1, 1, 1],
+                               padding=padding, name="max_pool")
+    else:
+        crops = tf.image.crop_and_resize(inputs, bboxes, tf.to_int32(batch_inds),
+                                         [pool_size, pool_size], name="crops")
+    if flatten:
+        return tf.layers.flatten(crops)
+    else:
+        return crops
 
 
 class TrainModel(collections.namedtuple("TrainModel",
@@ -179,19 +235,22 @@ class TrainModel(collections.namedtuple("TrainModel",
 def create_train_model(model_creator,
                        hparams,
                        scope=None):
-    dataset_dir = os.path.join(build_tfrecord.FLAGS.output_dir, "train")
+    dataset_dir = os.path.join(hparams.data_dir, "eval")  # test
     filenames = tf.gfile.ListDirectory(dataset_dir)
     for i in range(len(filenames)):
         filenames[i] = os.path.join(dataset_dir, filenames[i])
     graph = tf.Graph()
     with graph.as_default(), tf.container(scope or "train"):
-        with tf.name_scope("DataSet"):
-            raw_dataset = tf.data.TFRecordDataset(filenames)
-            data_wrapper = iterator_wrapper.get_iterator_wrapper(
-                raw_dataset, hparams.batch_size)
+        with tf.name_scope("Data"):
+            with tf.device("/cpu:0"):
+                reverse_cate_table = misc.create_reverse_category_table(hparams.category_file)
+                raw_dataset = tf.data.TFRecordDataset(filenames)
+                data_wrapper = iterator_wrapper.get_iterator_wrapper(
+                    raw_dataset, hparams.img_batch_size)
         model = model_creator(
-            haparms=hparams,
-            wrapper=data_wrapper,
+            hparams=hparams,
+            reverse_cate_table=reverse_cate_table,
+            data_wrapper=data_wrapper,
             scope=scope)
     return TrainModel(
         graph=graph,
@@ -200,18 +259,146 @@ def create_train_model(model_creator,
 
 
 class InferModel(collections.namedtuple("InferModel",
-                                        ("graph", "model", "iterator"))):
+                                        ("graph", "model", "data_wrapper"))):
     pass
 
 
-def create_infer_model():
-    pass
+def create_infer_model(model_creator,
+                       hparams,
+                       scope=None):
+    dataset_dir = os.path.join(hparams.data_dir, "eval")
+    filenames = tf.gfile.ListDirectory(dataset_dir)
+    images = []
+    for i in range(len(filenames)):
+        filenames[i] = os.path.join(dataset_dir, filenames[i])
+        with tf.gfile.GFile(filenames[i], "rb") as f:
+            images.append(f.read())
+    graph = tf.Graph()
+    with graph.as_default(), tf.container(scope or "eval"):
+        with tf.name_scope("Data"):
+            with tf.device("/cpu:0"):
+                reverse_cate_table = misc.create_reverse_category_table(hparams.category_file)
+                raw_dataset = tf.data.Dataset()
+                raw_dataset = raw_dataset.from_tensor_slices(images)
+                data_wrapper = iterator_wrapper.get_infer_iterator_wrapper(
+                    raw_dataset, hparams.img_batch_size)
+        model = model_creator(
+            hparams=hparams,
+            reverse_cate_table=reverse_cate_table,
+            data_wrapper=data_wrapper,
+            scope=scope)
+        return InferModel(
+            graph=graph,
+            model=model,
+            data_wrapper=data_wrapper)
 
 
 class EvalModel(collections.namedtuple("EvalModel",
-                                       ("graph", "model", "iterator"))):
+                                       ("graph", "model", "data_wrapper"))):
     pass
 
 
-def create_eval_model():
-    pass
+def create_eval_model(model_creator,
+                      hparams,
+                      scope=None):
+    dataset_dir = os.path.join(hparams.data_dir, "eval")
+    filenames = tf.gfile.ListDirectory(dataset_dir)
+    for i in range(len(filenames)):
+        filenames[i] = os.path.join(dataset_dir, filenames[i])
+    graph = tf.Graph()
+    with graph.as_default(), tf.container(scope or "eval"):
+        with tf.name_scope("Data"):
+            with tf.device("/cpu:0"):
+                reverse_cate_table = misc.create_reverse_category_table(hparams.category_file)
+                raw_dataset = tf.data.TFRecordDataset(filenames)
+                data_wrapper = iterator_wrapper.get_iterator_wrapper(
+                    raw_dataset, hparams.img_batch_size)
+        model = model_creator(
+            hparams=hparams,
+            reverse_cate_table=reverse_cate_table,
+            data_wrapper=data_wrapper,
+            scope=scope)
+        return EvalModel(
+            graph=graph,
+            model=model,
+            data_wrapper=data_wrapper)
+
+
+def gradient_clip(gradients, max_gradient_norm):
+    with tf.device("/CPU:0"):
+        clipped_gradients, gradient_norm = tf.clip_by_global_norm(
+            gradients, max_gradient_norm)
+        gradient_norm_summaries = list()
+        gradient_norm_summaries.append(tf.summary.scalar("grad_norm", gradient_norm))
+        gradient_norm_summaries.append(
+            tf.summary.scalar("TRAIN/clipped_gradient", tf.global_norm(clipped_gradients)))
+    return clipped_gradients, gradient_norm_summaries, gradient_norm
+
+
+def restore_pre_model(model_scope, ckpt_file):
+    """
+    Create an op that restore pre-trained model from
+    specified checkpoint file
+    :param model_scope: the variable scope where variables were stored
+    :param ckpt_file: checkpoint file
+    :return: restore variables operation
+    """
+    print("Set up pre-trained model's restore op")
+    variables = tf.get_collection(
+        tf.GraphKeys.GLOBAL_VARIABLES, scope=model_scope)
+    saver = tf.train.Saver(variables)
+    restore_fn = tf.no_op()
+    if ckpt_file and misc.check_file_existence(ckpt_file):
+        def restore_fn(sess):
+            tf.logging.info(
+                "Restore variables form '%s'" % ckpt_file)
+            saver.restore(sess, ckpt_file)
+    return restore_fn
+
+
+def print_variables_in_ckpt(ckpt_path):
+    """Print a list of variables in a checkpoint together with their shapes."""
+    print("# Variables in ckpt %s" % ckpt_path)
+    reader = tf.train.NewCheckpointReader(ckpt_path)
+    variable_map = reader.get_variable_to_shape_map()
+    for key in sorted(variable_map.keys()):
+        print("  %s: %s" % (key, variable_map[key]))
+
+
+def load_model(model,
+               ckpt_path,
+               session,
+               init_op=None,
+               name="restore"):
+    start_time = time.time()
+    ckpt = tf.train.get_checkpoint_state(
+        os.path.dirname(ckpt_path))
+    if ckpt and ckpt.model_checkpoint_path:
+        if init_op:
+            print("Restore a pre-trained model")
+            init_op(session)
+        model.saver.restore(session, ckpt.model_checkpoint_path)
+    else:
+        print("Can't load checkpoint")
+    print(
+        "  loaded %s model parameters from %s, time %.2fs" %
+        (name, ckpt_path, time.time() - start_time))
+    return model
+
+
+def create_or_load_model(model,
+                         model_dir,
+                         session,
+                         init_op=None):
+    latest_ckpt = tf.train.latest_checkpoint(model_dir)
+    if latest_ckpt:
+        model = load_model(model, latest_ckpt, session, init_op, "restore")
+    else:
+        start_time = time.time()
+        session.run(tf.global_variables_initializer())
+        session.run(tf.tables_initializer())
+        print("  created %s model with fresh parameters, time %.2fs" %
+              (model.scope, time.time() - start_time))
+    global_step = model.global_step.eval(session=session)
+    print("global_step=%d" % global_step)
+    return model, global_step
