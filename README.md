@@ -20,7 +20,7 @@ see Issue https://github.com/tensorflow/tensorflow/issues/26961
 tensorflow-gpu: 1.13.1
 CUDA: 10.0.130
 CUDNN: 7.3.1
-GPU: RTX-2070
+GPU: Nvida RTX-2070
 
 # This model is unable to work now,cause 
 UnknownError (see above for traceback): Failed to get convolution algorithm. This is probably because cuDNN failed to initialize, so try looking to see if a warning log message was printed above.
