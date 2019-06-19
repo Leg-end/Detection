@@ -17,12 +17,21 @@ Inception_V3 unable to work temporarily,cause Tensorflow's avg pooling method do
 see Issue https://github.com/tensorflow/tensorflow/issues/26961
 
 # Environment
+old:
 tensorflow-gpu: 1.13.1
 CUDA: 10.0.130
 CUDNN: 7.3.1
 GPU: Nvida RTX-2070
-
-# This model is unable to work now,cause 
+new:
+tensorflow-gpu: 1.9.0
+CUDA: 9.0.176
+CUDNN: 7.3.0
+GPU: Nvida RTX-2070
+# This model is unable to work now,cause (fixed)
 UnknownError (see above for traceback): Failed to get convolution algorithm. This is probably because cuDNN failed to initialize, so try looking to see if a warning log message was printed above.
 	 [[node vgg_16/conv1/conv1_1/Conv2D (defined at F:\Pycharm\PyCharm Community Edition 2018.3.5\workspace\Detection\models\vgg_16.py:20) ]]
+It looks like the error was caused by unmatching between CUDA and CUDNN, but i am not 100% sure.
+Solution
+Change environment to the new one may fix this problem
+# This model is unable to work now, cause the calculation from model is wrong when i draw calculated bounding box on images, remain fixing and updating
 
