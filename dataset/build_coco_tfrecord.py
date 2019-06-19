@@ -87,39 +87,32 @@ def _float_feature_list(values):
     return tf.train.FeatureList(feature=[_float_feature(v) for v in values])
 
 
-def _load_cls_bboxes(annotations):
+def _load_cls_bboxes(annotations, im_infos):
     id_to_cls_bboxes = {}
     for entity in annotations:
         image_id = entity["image_id"]
+        _, height, width = im_infos[image_id]
         cls_id = entity["category_id"]
-        bbox = _transform_bbox(entity["bbox"], cls_id)
-        # [[x_left], [y_top], [x_right], [y_bottom], [category_id]]
+        bbox = _transform_bbox(entity["bbox"], cls_id, height, width)
+        # [[x_left], [y_bottom], [x_right], [y_top], [category_id]]
         id_to_cls_bboxes.setdefault(image_id, [[], [], [], [], []])
         for i, item in enumerate(id_to_cls_bboxes[image_id]):
             item.append(bbox[i])
     return id_to_cls_bboxes
 
 
-def _transform_bbox(bbox, cls_id):
+def _transform_bbox(bbox, cls_id, height, width):
     """
     Validate that whether the box is out of the range of image
     :param bbox: bounding box [x_left, y_right, width, height]
     :param cls_id: bounding box's category id
-    :return: [x_left, y_top, x_right, y_bottom, category_id]
+    :return: [x_left, y_bottom, x_right, y_top, category_id]
     """
-    x_l = bbox[0]
-    y_t = bbox[1]
-    x_r = x_l+bbox[2]
-    y_b = y_t+bbox[3]
-    return [x_l, y_t, x_r, y_b, cls_id]
-
-
-def _valid_bbox(bbox, height, width):
-    bbox[0] = max(0, bbox[0])
-    bbox[1] = max(0, bbox[1])
-    bbox[2] = min(bbox[2], width-1)
-    bbox[3] = min(bbox[3], height-1)
-    return bbox
+    x_left = max(0, bbox[0])
+    y_top = max(0, bbox[1])
+    x_right = min(width-1, x_left + max(0, bbox[2]-1))
+    y_bottom = min(height-1, y_top + max(0, bbox[3]-1))
+    return [x_left, y_bottom, x_right, y_top, cls_id]
 
 
 def _to_sequence_example(image, decoder):
@@ -142,9 +135,9 @@ def _to_sequence_example(image, decoder):
     })
     feature_lists = tf.train.FeatureLists(feature_list={
         "bbox/locations/x_l": _float_feature_list(bboxes[0]),
-        "bbox/locations/y_t": _float_feature_list(bboxes[1]),
+        "bbox/locations/y_b": _float_feature_list(bboxes[1]),
         "bbox/locations/x_r": _float_feature_list(bboxes[2]),
-        "bbox/locations/y_b": _float_feature_list(bboxes[3]),
+        "bbox/locations/y_t": _float_feature_list(bboxes[3]),
         "bbox/categories": _int64_feature_list(bboxes[4]),
         "image/size": _int64_feature_list([image.height, image.width, 3])
     })
@@ -258,12 +251,11 @@ def load_and_process_metadata(desc_file, img_dir):
     with tf.gfile.FastGFile(desc_file, "r") as f:
         desc_data = json.load(f)
     # Extract filename of image
-
-    id_to_img_info = [(entity["id"], entity["file_name"], entity["height"], entity["width"])
-                      for entity in desc_data["images"]]
+    id_to_img_info = {entity["id"]: (entity["file_name"], entity["height"], entity["width"])
+                      for entity in desc_data["images"]}
     # Extract the target label, each image_id may associated with multiple labels
     annotations = desc_data["annotations"]
-    id_to_bboxes = _load_cls_bboxes(annotations)
+    id_to_bboxes = _load_cls_bboxes(annotations, id_to_img_info)
     # debug(id_to_img_info, id_to_bboxes)
     print("Loaded detection metadata for %d images from %s"
           % (len(id_to_img_info), desc_file))
@@ -272,12 +264,11 @@ def load_and_process_metadata(desc_file, img_dir):
     image_metadata = []
     num_bbox = 0
     skip_num = 0
-    for image_id, base_filename, height, width in id_to_img_info:
-        if image_id in id_to_bboxes:
-            bboxes = id_to_bboxes[image_id]
-        else:
+    for image_id, (base_filename, height, width) in id_to_img_info.items():
+        if image_id not in id_to_bboxes:
             skip_num += 1
             continue
+        bboxes = id_to_bboxes[image_id]
         path = os.path.join(img_dir, base_filename)
         image_metadata.append(ImageMetadata(image_id, height, width, path, bboxes))
         num_bbox += len(bboxes)
