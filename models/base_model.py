@@ -7,8 +7,25 @@ from tensorflow.contrib import slim
 from . import rpn_model
 from . import rcnn_model
 from utils import misc_util as misc
-from utils import proposal_util
+from utils import proposal_util, anchor_util
 import collections
+
+# Put anything that you want to print into 'debug_pool', then it will be printed when session runs
+debug_pool = dict()
+
+
+def inject_to_debug_pool(debug=True, **kwargs):
+    if not debug:
+        return
+    global debug_pool
+    debug_pool.update(kwargs)
+
+
+class DetectResult(collections.namedtuple("DetectResult",
+                                          ("images", "bboxes",
+                                           "categories", "im_info",
+                                           "scores"))):
+    pass
 
 
 class TrainOutputTuple(collections.namedtuple(
@@ -55,15 +72,15 @@ class BaseModel(object):
         """
         raise NotImplementedError
 
-    def __init__(self, hparams, data_wrapper, reverse_cate_table, scope=None):
+    def __init__(self, hparams, reverse_cate_table, data_wrapper=None, scope=None):
         self._set_params(hparams, data_wrapper, reverse_cate_table, scope)
         with slim.arg_scope([slim.conv2d, slim.conv2d_in_plane,
                              slim.conv2d_transpose, slim.separable_conv2d, slim.fully_connected],
                             weights_regularizer=self.weights_regularizer,
                             biases_regularizer=self.biases_regularizer,
                             biases_initializer=tf.constant_initializer(0.0)):
-            losses, rpn_info = self._build_graph()
-        self._deploy_exe_info(losses, rpn_info)
+            losses, info = self._build_graph()
+        self._deploy_exe_info(losses, info)
         # Saver
         with tf.device("/cpu:0"):
             self.saver = tf.train.Saver(
@@ -79,15 +96,13 @@ class BaseModel(object):
                          tf.GraphKeys.GLOBAL_VARIABLES])
 
     def _set_params(self, hparams, data_wrapper, reverse_cate_table, scope=None):
-        # Put anything that you want to print into 'print_pool', then it will be printed when session runs
-        self.print_pool = dict()
         # Store tensors that will be feed in histogram summary
         self.histogram = dict()
         # Store summaries
         self.summaries = list()
         # Store the specific layer's activation for visual utility
         self.activations = list()
-        self.restore_op = tf.no_op()
+        self.restore_op = None
         self.reverse_cate_table = reverse_cate_table
         self.scope = scope
         self.feat_stride = [16]
@@ -97,11 +112,20 @@ class BaseModel(object):
         self.tunable = hparams.tunable
         self.predicable = hparams.mode is "infer"
         # Set data
-        assert isinstance(data_wrapper, iterator_wrapper.DataWrapper)
-        # !!!Make sure dataset batch size is 1
-        self.im_info = data_wrapper.images_size
-        self.images_data = data_wrapper.images_data
-        self.bbox_labels = data_wrapper.bbox_locations
+        if not self.predicable:
+            assert isinstance(data_wrapper, iterator_wrapper.DataWrapper)
+            # !!!Make sure dataset batch size is 1
+            self.im_info = data_wrapper.images_size
+            self.images_data = data_wrapper.images_data
+            self.gt_bboxes = data_wrapper.bbox_locations
+            self.categories_id = data_wrapper.categories_id
+        else:
+            self.im_info = tf.placeholder(shape=[3], dtype=tf.int32, name="size_feed")
+            self.images_data = tf.placeholder(
+                shape=[1, None, None, 3], dtype=tf.float32, name="image_feed")
+            self.gt_bboxes = None
+            self.categories_id = None
+        debug_pool.update(images_info=self.im_info)
         # Initializer
         self.initializer = helper.get_initializer(
             hparams.init_op, hparams.ran_seed, hparams.init_weight)
@@ -159,43 +183,39 @@ class BaseModel(object):
                     self.histogram.update({param.name: param})
                     print("  %s, %s, %s" % (param.name, str(param.get_shape()),
                                             param.op.device))
-                self.histogram.update(train_loss=self.train_loss,
-                                      learning_rate=self.learning_rate)
-                if hp.forward_rcnn:
-                    self.class_predicts = self.reverse_cate_table.lookup(
-                        tf.to_int64(info["class_predicts"]))
-                    self.detected_images = tf.py_function(
-                        misc.draw_boxes_on_image,
-                        [self.images_data, info["bbox_labels"],
-                         info["class_scores"], self.class_predicts,
-                         self.im_info, hp.pixel_mean], Tout=tf.float32)
+                self.categories = self.reverse_cate_table.lookup(self.categories_id)[0]
+                self.bbox_scores = info["roi_scores"]
                 self.train_summary = self._config_train_summary()
             elif self.predicable:  # Infer
-                stddevs = tf.tile(tf.constant(hp.bbox_norm_stddevs), multiples=hp.num_class)
-                means = tf.tile(tf.constant(hp.bbox_norm_means), multiples=hp.num_class)
-                deltas = info["bbox_predicts"]
+                # stddevs = tf.tile(tf.constant(hp.bbox_norm_stddevs), multiples=[hp.num_class])
+                # means = tf.tile(tf.constant(hp.bbox_norm_means), multiples=[hp.num_class])
+                deltas = info["roi_deltas"]
                 # Restore bbox predicts
-                deltas = tf.add(tf.multiply(deltas, stddevs), means)
-                info["bbox_predicts"] = deltas
+
+                # deltas = tf.add(tf.multiply(deltas, stddevs), means)
+                # info["bbox_predicts"] = deltas
                 rois = info["rois"]
-                self.class_scores = info["class_scores"]
-                self.class_predicts = self.reverse_cate_table.lookup(
-                    tf.to_int64(info["class_predicts"]))
+                self.bbox_scores = info["roi_scores"]
+                if hp.forward_rcnn:
+                    self.categories = self.reverse_cate_table.lookup(
+                        tf.to_int64(info["class_predicts"]))
+                else:
+                    self.categories = info["class_predicts"]
+                # Get ground-truth bounding boxes
+                self.pgt_bboxes = anchor_util.get_coco_anchors(
+                    proposal_util.bboxes_regression(rois[:, 1:], deltas))
+                debug_pool.update(rois=rois, gt_bboxes=self.pgt_bboxes)
                 # Get predicted ground-truth bbox
-                self.bboxes = proposal_util.bboxes_regression(rois, deltas)
-                self.detected_images = tf.py_function(
-                    misc.draw_boxes_on_image,
-                    [self.images_data, self.bboxes,
-                     self.class_scores, self.class_predicts,
-                     self.im_info, hp.pixel_mean], Tout=tf.float32)
                 self.infer_summary = self._config_infer_summary()
             else:  # Eval
                 rois = info["rois"]
-                deltas = info["bbox_predicts"]
+                deltas = info["roi_deltas"]
                 self.eval_loss = losses
-                bboxes = proposal_util.bboxes_regression(rois, deltas)
+                # Get predicted ground-truth bounding boxes
+                self.pgt_bboxes = anchor_util.get_coco_anchors(
+                    proposal_util.bboxes_regression(rois[:, 1:], deltas))
                 self.accuracy = misc.mean_avg_overlap(
-                    bboxes, self.bbox_labels)
+                    self.pgt_bboxes, self.gt_bboxes[:, 0:4])
                 self.eval_summary = self._config_eval_summary()
 
     def _build_graph(self):
@@ -204,26 +224,25 @@ class BaseModel(object):
         conv_feat = self._image_to_head(self.images_data)
         # RPN
         with slim.arg_scope(rpn_model.rpn_arg_scope(weights_initializer=self.initializer)):
-            rois, rpn_info, rpn_print_pool, rpn_activation = rpn_model.rpn_base(
-                conv_feat, self.hparams, self.im_info, self.bbox_labels,
+            rois, rpn_info, rpn_activation = rpn_model.rpn_base(
+                conv_feat, self.hparams, self.im_info, self.gt_bboxes,
                 feat_stride=self.feat_stride[0], anchor_count=self.ori_count,
-                trainable=self.trainable)
-            self.print_pool.update(rpn_print_pool)
+                trainable=self.trainable, predictable=self.predicable)
             self.activations.append(rpn_activation)
             self.histogram.update(rpn_dict=rpn_info)
         if self.hparams.forward_rcnn:
             # Fast-RCNN
-            rcnn_info, rcnn_print_pool, rcnn_activation = rcnn_model.rcnn_base(
+            rcnn_info, rcnn_activation = rcnn_model.rcnn_base(
                 conv_feat, self.hparams, rois,
                 roi_scores=rpn_info["bbox_scores"],
-                bbox_labels=self.bbox_labels,
+                bbox_labels=self.gt_bboxes,
                 anchor_labels=rpn_info["bbox_labels"],
                 trainable=self.trainable,
+                predictable=self.predicable,
                 roi_pool_layer=self._roi_pool_layer,
                 head_to_tail=self._head_to_tail,
                 cls_weights_initializer=self.initializer,
                 reg_weights_initializer=self.bbox_initializer)
-            self.print_pool.update(rcnn_print_pool)
             self.activations.append(rcnn_activation)
             self.histogram.update(rcnn_dict=rpn_info)
         # Calculate loss
@@ -252,6 +271,7 @@ class BaseModel(object):
     @staticmethod
     def _smooth_l1_loss(pre_deltas, tgt_deltas, in_weights,
                         out_weights, sigma=3., axis=None):
+        sigma = sigma ** 2
         differs = tf.subtract(pre_deltas, tgt_deltas)
         posi_differs = tf.abs(tf.multiply(differs, in_weights))
         smooth_signal = tf.stop_gradient(tf.to_float(tf.less(posi_differs, tf.divide(1., sigma))))
@@ -262,6 +282,8 @@ class BaseModel(object):
         return loss
 
     def _loss_func(self, rpn_info=None, rcnn_info=None):
+        if self.predicable:
+            return tf.constant(0.0)
         with tf.name_scope("cal_loss"):
             with tf.device("/cpu:0"):
                 rpn_loss = rpn_model.rpn_loss(rpn_info, self._smooth_l1_loss)
@@ -293,17 +315,23 @@ class BaseModel(object):
                                 'TRAIN/' + key + '/' + k, v))
                     else:
                         self._add_to_summaries(tf.summary.histogram('TRAIN/' + key, item))
-                # Detected image
-                if self.hparams.forward_rcnn:
-                    self._add_to_summaries(tf.summary.image(
-                        'TRAIN/detected_image', self.detected_images))
+                # Detected image with ground-truth box
+                self._add_to_summaries(tf.summary.image(
+                    'INFER/image', self.images_data))
+                # loss & lr
+                self._add_to_summaries(tf.summary.scalar(
+                    'TRAIN/train_loss', self.train_loss))
+                self._add_to_summaries(tf.summary.scalar(
+                    'TRAIN/learning_rate', self.learning_rate))
         return tf.summary.merge(self.summaries)
 
     def _config_eval_summary(self):
         with tf.name_scope("eval_summary"):
             with tf.device("/cpu:0"):
-                self._add_to_summaries(tf.summary.histogram(
-                    'Eval/eval_loss', self.eval_loss))
+                self._add_to_summaries(tf.summary.scalar(
+                    'EVAL/eval_loss', self.eval_loss))
+                self._add_to_summaries(tf.summary.scalar(
+                    'EVAL/accuracy', self.accuracy))
         return tf.summary.merge(self.summaries)
 
     def _config_infer_summary(self):
@@ -311,9 +339,6 @@ class BaseModel(object):
             with tf.device("/cpu:0"):
                 self._add_to_summaries(tf.summary.image(
                     'INFER/image', self.images_data))
-                self._add_to_summaries(tf.summary.image(
-                    'INFER/detection_result',
-                    self.detected_images))
         return tf.summary.merge(self.summaries)
 
     def train(self, sess):
@@ -323,29 +348,42 @@ class BaseModel(object):
                                         summary=self.train_summary,
                                         learning_rate=self.learning_rate,
                                         grad_norm=self.grad_norm)
-        self.restore_op(sess)
-        if self.print_pool:
-            print("DEBUG--->", sess.run(self.print_pool))
-        return sess.run([self.update, output_tuple])
+        detect_result = DetectResult(images=self.images_data[0],
+                                     bboxes=anchor_util.get_anchors_info(self.gt_bboxes),
+                                     categories=self.categories,
+                                     im_info=self.im_info,
+                                     scores=self.bbox_scores)
+        if debug_pool:
+            print("DEBUG--->", sess.run(debug_pool))
+        return sess.run([self.update, output_tuple, detect_result])
 
     def eval(self, sess):
         output_tuple = EvalOutputTuple(loss=self.eval_loss,
                                        batch_size=tf.shape(self.images_data)[0],
                                        summary=self.eval_summary,
                                        accuracy=self.accuracy)
-        if self.print_pool:
-            print("DEBUG--->", sess.run(self.print_pool))
+        if debug_pool:
+            print("DEBUG--->", sess.run(debug_pool))
         return sess.run(output_tuple)
 
-    def infer(self, sess):
-        output_tuple = InferOutputTuple(bboxes=self.bboxes,
-                                        images=self.detected_images,
-                                        categories=self.class_predicts,
-                                        scores=self.class_scores,
+    def infer(self, sess, image_feed, size_feed):
+        # bboxes: [ctr_x, ctr_y, width, height]
+        output_tuple = InferOutputTuple(bboxes=self.pgt_bboxes,
+                                        images=self.images_data[0],
+                                        categories=self.categories,
+                                        scores=self.bbox_scores,
                                         summary=self.infer_summary)
-        if self.print_pool:
-            print("DEBUG--->", sess.run(self.print_pool))
-        return sess.run(output_tuple)
+        # gt_bboxes = proposal_util.clip_bboxes(anchor_util.get_coco_anchors(debug_pool["anchors"]), self.im_info)
+        detect_result = DetectResult(images=self.images_data[0],
+                                     bboxes=self.pgt_bboxes,
+                                     categories=self.categories,
+                                     im_info=self.im_info,
+                                     scores=self.bbox_scores)
+        if debug_pool:
+            print("DEBUG--->", sess.run(debug_pool, feed_dict={
+                'image_feed:0': image_feed, 'size_feed:0': size_feed}))
+        return sess.run([output_tuple, detect_result], feed_dict={
+            'image_feed:0': image_feed, 'size_feed:0': size_feed})
 # ------------------------------------->Learning rate---------------------------->
 
     def _get_learning_rate_warmup(self):

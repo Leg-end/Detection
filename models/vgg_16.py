@@ -6,11 +6,11 @@ import os
 
 
 class VGG16B(BaseModel):
-    def __init__(self, hparams, data_wrapper, reverse_cate_table, scope=None):
+    def __init__(self, hparams, reverse_cate_table, data_wrapper, scope=None):
         if not scope:
             scope = "vgg_16"
         self.feat_stride = [16]
-        super(VGG16B, self).__init__(hparams, data_wrapper, reverse_cate_table, scope)
+        super(VGG16B, self).__init__(hparams, reverse_cate_table, data_wrapper, scope)
 
     def _image_to_head(self, inputs, reuse=None):
         with tf.variable_scope(self.scope, self.scope, reuse=reuse):
@@ -33,8 +33,9 @@ class VGG16B(BaseModel):
             net = slim.repeat(net, 3, slim.conv2d, 512, kernel_size,
                               trainable=self.tunable, scope='conv5')
             # prepare restore op
-            self.restore_op = helper.restore_pre_model(
-                self.scope, os.path.join(self.hparams.pre_ckpt_dir, self.scope + ".ckpt"))
+            if self.restore_op is None:
+                self.restore_op = helper.restore_pre_model(
+                    self.scope, os.path.join(self.hparams.pre_ckpt_dir, self.scope + ".ckpt"))
         return net
 
     def _head_to_tail(self, inputs, reuse=None):

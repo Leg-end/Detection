@@ -10,6 +10,9 @@ from tensorflow.contrib.slim.python.slim.nets import resnet_v1
 from tensorflow.contrib.slim.python.slim.nets.resnet_v1 import resnet_v1_block
 import model_helper as helper
 import math
+import main
+import argparse
+from utils import anchor_util
 import os
 
 
@@ -112,15 +115,101 @@ class ResNetV1(object):
                 num_units=num_units[i], stride=strides[i]))
 
 
+class VGG16B(object):
+    def __init__(self, scope=None):
+        if not scope:
+            self.scope = "vgg_16"
+        self.feat_stride = [16]
+        self.tunable = False
+        self.trainable = False
+
+    def image_to_head(self, inputs, reuse=None):
+        with tf.variable_scope(self.scope, self.scope, reuse=reuse):
+            kernel_size = [3, 3]
+            pool_size = [2, 2]
+            net = slim.repeat(inputs, 2, slim.conv2d, 64, kernel_size,
+                              trainable=self.tunable, scope='conv1')
+            net = slim.max_pool2d(net, pool_size, padding='SAME', scope='pool1')
+            net = slim.repeat(net, 2, slim.conv2d, 128, kernel_size,
+                              trainable=self.tunable, scope='conv2')
+            net = slim.max_pool2d(net, pool_size, padding='SAME', scope='pool2')
+            net = slim.repeat(net, 3, slim.conv2d, 256, kernel_size,
+                              trainable=self.tunable, scope='conv3')
+            net = slim.max_pool2d(net, pool_size, padding='SAME',
+                                  scope='pool3')
+            net = slim.repeat(net, 3, slim.conv2d, 512, kernel_size,
+                              trainable=self.tunable, scope='conv4')
+            net = slim.max_pool2d(net, pool_size, padding='SAME',
+                                  scope='pool4')
+            net = slim.repeat(net, 3, slim.conv2d, 512, kernel_size,
+                              trainable=self.tunable, scope='conv5')
+            # prepare restore op
+            # if self.restore_op is None:
+            #     self.restore_op = helper.restore_pre_model(
+            #         self.scope, os.path.join(self.hparams.pre_ckpt_dir, self.scope + ".ckpt"))
+        return net
+
+    def head_to_tail(self, inputs, reuse=None):
+        with tf.variable_scope(self.scope, self.scope, reuse=reuse):
+            net = slim.fully_connected(inputs, 4096, scope="fc6",
+                                       trainable=self.trainable)
+            if self.trainable:
+                net = slim.dropout(net, keep_prob=0.5, scope="dropout6",
+                                   is_training=self.trainable)
+            net = slim.fully_connected(net, 4096, scope="fc7",
+                                       trainable=self.trainable)
+            if self.trainable:
+                net = slim.dropout(net, keep_prob=0.5, scope="dropout7",
+                                   is_training=self.trainable)
+        return net
+
+
+def _rpn_cls_layer(inputs, num_output, scope="rpn_cls_layer", trainable=False):
+    # scores = layers.conv2d(inputs, num_output, [1, 1], trainable=self.trainable,
+    #                        weights_initializer=self.initializer, padding='VALID',
+    #                        activation_fn=None, scope=name)
+    scores = slim.conv2d(inputs, num_output, [1, 1], trainable=trainable, padding='VALID',
+                         activation_fn=None, scope=scope)
+    # Fix channel as 2
+    reshaped_scores = helper.reshape_for_forward_pairs(scores, 2, name="rpn_cls_score_reshape")
+    shape = tf.shape(reshaped_scores)
+    reshaped = tf.reshape(reshaped_scores, shape=[-1, shape[-1]])
+    outputs = tf.nn.softmax(reshaped, name="rpn_cls_score_softmax")
+    reshaped_probs = tf.reshape(outputs, shape=shape)
+    # Get predict class id
+    predicts = tf.argmax(tf.reshape(reshaped_scores, shape=[-1, 2]), axis=1, name="rpn_cls_predict_argmax")
+    # Switch to original channel, after softmax, here we get prob for positive and negative
+    # Form as [n, n,....,n (count=num_outputs/2), p, p, ......,p (count=num_outputs/2)]
+    probs = helper.reshape_for_forward_pairs(reshaped_probs, num_output, name="rpn_cls_prob_reshape")
+    return probs, predicts, scores, reshaped_scores
+
+
 def rpn():
+    param_parser = argparse.ArgumentParser()
+    main.add_arguments(param_parser)
+    flags = param_parser.parse_args()
+    flags = vars(flags)
+    def_hparams = main.create_hparams(flags)
+    main.pre_fill_params_into_utils(def_hparams)
     image = tf.ones(shape=[1, 640, 480, 3])
-    net = ResNetV1()
+    bbox_target = tf.constant([[80.54, 25.89, 250.25, 606.92, 25.],
+                               [125.55, 367.46, 349.09, 263.35, 46.],
+                               [480.99, 177.05, 23.44, 29.71, 71.]])
+    net = VGG16B()
     net_conv = net.image_to_head(image)
+    anchors, _ = helper.generate_img_anchors([640, 480, 3])
     rpn = slim.conv2d(net_conv, 128, [3, 3], trainable=False,  scope="rpn_conv/3x3")
-    rpn_bbox_pred = slim.conv2d(rpn, 9 * 4, [1, 1], trainable=False,
+    rpn_bbox_pred = slim.conv2d(rpn, 36, [1, 1], trainable=False,
                                 padding='VALID', activation_fn=None, scope='rpn_bbox_pred')
+    probs, predicts, scores, reshaped_scores = _rpn_cls_layer(
+        rpn, 18)
+    rois, roi_scores = helper.sample_rois_from_anchors(
+        probs, rpn_bbox_pred, [640, 480, 3], anchors, 9)
+    rpn_labels, rpn_bbox_targets, rpn_inside_weights, rpn_outside_weights = anchor_util.generate_anchor_targets(
+        scores, anchors, bbox_target, [640, 80, 3], 9)
+    rpn_labels = tf.to_int32(rpn_labels)
     with tf.Session() as sess:
-        print(sess.run(tf.shape(rpn_bbox_pred)))
+        print(sess.run([rpn_outside_weights]))
 
 
 if __name__ == "__main__":

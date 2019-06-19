@@ -10,7 +10,7 @@ class VGG16(BaseModel):
         if not scope:
             scope = "vgg_16"
         self.feat_stride = [16]
-        super(VGG16, self).__init__(hparams, data_wrapper, reverse_cate_table, scope)
+        super(VGG16, self).__init__(hparams, reverse_cate_table, data_wrapper, scope)
 
     def _image_to_head(self, inputs, reuse=None):
         with tf.variable_scope(self.scope, self.scope, reuse=reuse):

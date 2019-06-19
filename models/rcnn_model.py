@@ -37,6 +37,7 @@ def rcnn_base(inputs,
               roi_pool_layer,
               head_to_tail,
               trainable=True,
+              predictable=False,
               anchor_labels=None,
               cls_weights_initializer=None,
               reg_weights_initializer=None):
@@ -50,23 +51,22 @@ def rcnn_base(inputs,
     :param roi_pool_layer: rois' pooling function(layer)
     :param head_to_tail: fully connect network
     :param trainable: whether to train this network
+    :param predictable: is in infer mode
     :param bbox_labels: target bounding box
     :param anchor_labels: anchor labels when using rpn to generate roi
     :param cls_weights_initializer: weights initializer for classification layer
     :param reg_weights_initializer: weights initializer for regression layer
     :return: rect object proposals, scores, print_pool(dict) for debugging, activation(dict) for visualization
     """
-    # For debugging
-    print_pool = dict()
-    # For activation
-    activation = None
     with tf.variable_scope("rcnn"):
         with tf.device(helper.get_device_str(device_id=0, num_gpus=hp.num_gpus)):
             # Fill rcnn's bbox_label, class_label, in_weights, out_weights, rois
-            rcnn_info, rois, _ = helper.pack_proposal_info(
-                anchor_labels, rois, bbox_scores=roi_scores,
-                bbox_targets=tf.squeeze(bbox_labels, axis=0),
-                num_class=hp.num_class)
+            rcnn_info = dict()
+            if not predictable:
+                rcnn_info, rois, _ = helper.pack_proposal_info(
+                    anchor_labels, rois, bbox_scores=roi_scores,
+                    bbox_targets=bbox_labels,
+                    num_class=hp.num_class)
             pool = roi_pool_layer(inputs, rois)
             fc = head_to_tail(pool)
             probs, predicts, scores = _rcnn_cls_layer(fc, hp.num_class,
@@ -79,7 +79,7 @@ def rcnn_base(inputs,
             misc.append_params(rcnn_info,
                                class_scores=scores, class_predicts=predicts,
                                class_probs=probs, bbox_predicts=deltas)
-    return rcnn_info, print_pool, activation
+    return rcnn_info, pool
 
 
 def rcnn_loss(rcnn_info, smooth_l1_loss):

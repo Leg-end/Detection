@@ -42,7 +42,7 @@ class ResNetV1(BaseModel):
         self.feat_stride = [16]
         self.num_layers = num_layers
         self._decide_block()
-        super(ResNetV1, self).__init__(hparams, data_wrapper, reverse_cate_table, scope)
+        super(ResNetV1, self).__init__(hparams, reverse_cate_table, data_wrapper, scope)
 
     def _build_base(self, inputs):
         with tf.variable_scope(self.scope, self.scope):

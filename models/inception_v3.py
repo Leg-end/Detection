@@ -11,7 +11,7 @@ class InceptionV3(BaseModel):
         if not scope:
             scope = "InceptionV3"
         self.feat_stride = [16]
-        super(InceptionV3, self).__init__(hparams, data_wrapper, reverse_cate_table, scope)
+        super(InceptionV3, self).__init__(hparams, reverse_cate_table, data_wrapper, scope)
 
     def _image_to_head(self, inputs, reuse=None):
         inception_output = self.inception_v3(
