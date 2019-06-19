@@ -1,6 +1,7 @@
 import tensorflow as tf
 from . import anchor_util
 from collections import namedtuple
+from models.base_model import inject_to_debug_pool
 
 __all__ = ["map_rois_to_feature", "sample_regions", "_compute_area",
            "_merge_ppl_tgt_boxes", "boxes_iou",
@@ -84,7 +85,7 @@ def sample_regions(bbox_scores, bbox_deltas,
     :param anchors: Anchors in image
     :param count: Count of anchors
     :return: The most possible k anchors with object inside and corresponding scores
-             The rois are formed as [batch_inds, proposal]
+             The rois are formed as [batch_inds, proposal] with compatible shape score and deltas
     """
     check_invoke()
     global params
@@ -99,53 +100,56 @@ def sample_regions(bbox_scores, bbox_deltas,
         anchors = tf.gather(anchors, indices)
         bbox_deltas = tf.gather(bbox_deltas, indices)
         proposals = bboxes_regression(anchors, bbox_deltas)
-        proposals = _clip_bboxes(proposals, im_info)
+        proposals = clip_bboxes(proposals, im_info)
     # Do regression to all anchors, the do nms
     elif params.sample_mode == "nms":
         proposals = bboxes_regression(anchors, bbox_deltas)
-        proposals = _clip_bboxes(proposals, im_info)
+        proposals = clip_bboxes(proposals, im_info)
         indices = tf.image.non_max_suppression(proposals, scores,
                                                max_output_size=params.post_nms_limit,
                                                iou_threshold=params.nms_thresh)
         proposals = tf.gather(proposals, indices=indices)
+        # make deltas has same shape as proposals
+        bbox_deltas = tf.gather(bbox_deltas, indices=indices)
         scores = tf.expand_dims(tf.gather(scores, indices=indices), axis=1)
     else:
         raise NotImplementedError("The infer mode you specific '%s', is not implemented yet" % params.sample_mode)
     batch_inds = tf.zeros(shape=(tf.shape(proposals)[0], 1), dtype=tf.float32)
     rois = tf.concat([batch_inds, proposals], axis=1)
-    return rois, scores
+    return rois, scores, bbox_deltas
 
 
-def bboxes_target_deltas(ex_rois, tg_rois):
-    assert tf.shape(ex_rois)[0] == tf.shape(tg_rois)[0]
-    ex_w, ex_h, ex_ctr_x, ex_ctr_y = anchor_util.get_anchors_info(ex_rois)
-    tg_w, tg_h, tg_ctr_x, tg_ctr_y = anchor_util.get_anchors_info(tg_rois)
-    tg_dx = tf.divide(tf.subtract(tg_ctr_x, ex_ctr_x), ex_w)
-    tg_dy = tf.divide(tf.subtract(tg_ctr_y, ex_ctr_y), ex_h)
-    tg_dw = tf.log(tf.divide(tg_w, ex_w))
-    tg_dh = tf.log(tf.divide(tg_h, ex_h))
-    return tf.stack([tg_dx, tg_dy, tg_dw, tg_dh], axis=1)
+def bboxes_target_deltas(ex_rois, gt_rois):
+    # assert tf.shape(ex_rois)[0] == tf.shape(gt_rois)[0]
+    ex_ctr_x, ex_ctr_y, ex_w, ex_h = anchor_util.get_anchors_info(ex_rois)
+    gt_ctr_x, gt_ctr_y, gt_w, gt_h = anchor_util.get_anchors_info(gt_rois)
+    gt_dx = tf.divide(tf.subtract(gt_ctr_x, ex_ctr_x), ex_w)
+    gt_dy = tf.divide(tf.subtract(gt_ctr_y, ex_ctr_y), ex_h)
+    gt_dw = tf.log(tf.divide(gt_w, ex_w))
+    gt_dh = tf.log(tf.divide(gt_h, ex_h))
+    return tf.squeeze(tf.stack([gt_dx, gt_dy, gt_dw, gt_dh], axis=1))
 
 
 def bboxes_regression(anchors, deltas):
     assert type(anchors) == type(deltas)
-    widths, heights, ctr_x, ctr_y = anchor_util.get_anchors_info(anchors)
+    # anchor [ctr_x, ctr_y, widths, heights]
+    ctr_x, ctr_y, widths, heights = anchor_util.get_anchors_info(anchors)
     dx, dy, dw, dh = anchor_util.get_mat_columns(deltas)
     pred_ctr_x = tf.add(tf.multiply(dx, widths), ctr_x)
     pred_ctr_y = tf.add(tf.multiply(dy, heights), ctr_y)
     pred_w = tf.multiply(tf.exp(dw), widths)
     pred_h = tf.multiply(tf.exp(dh), heights)
-    return anchor_util.make_anchors(pred_w, pred_h, pred_ctr_x, pred_ctr_y)
+    return anchor_util.make_anchors(pred_ctr_x, pred_ctr_y, pred_w, pred_h)
 
 
-def _clip_bboxes(bboxes, im_info):
+def clip_bboxes(bboxes, im_info):
     height = tf.cast(im_info[0] - 1, tf.float32)
     width = tf.cast(im_info[1] - 1, tf.float32)
     x_l, y_t, x_r, y_b = anchor_util.get_mat_columns(bboxes)
     x_l = tf.maximum(tf.minimum(x_l, width), 0.0)
     y_t = tf.maximum(tf.minimum(y_t, height), 0.0)
-    x_r = tf.maximum(tf.minimum(x_l, width), 0.0)
-    y_b = tf.maximum(tf.minimum(y_t, height), 0.0)
+    x_r = tf.maximum(tf.minimum(x_r, width), 0.0)
+    y_b = tf.maximum(tf.minimum(y_b, height), 0.0)
     return tf.squeeze(tf.stack([x_l, y_t, x_r, y_b], axis=1))
 
 
@@ -237,25 +241,21 @@ def _get_bbox_regression_labels(bbox_target_data, num_classes, bbox_in_weights):
     num_targets = tf.expand_dims(tf.range(tf.shape(bbox_target_data)[0]), 1)
     clss = tf.concat([num_targets, tf.to_int32(tf.expand_dims(bbox_target_data[:, 0], 1))], 1)
     tgt_updates = bbox_target_data[:, 1:]
-    bbox_targets = tf.tensor_scatter_update(
-        tensor=tf.ones([tf.shape(bbox_target_data)[0], num_classes, 4]),
-        indices=clss,
-        updates=tgt_updates)
-    """
+    # bbox_targets = tf.tensor_scatter_update(
+    #     tensor=tf.ones([tf.shape(bbox_target_data)[0], num_classes, 4]),
+    #     indices=clss,
+    #     updates=tgt_updates)
     bbox_targets = tf.scatter_nd(indices=clss,
                                  updates=tgt_updates,
                                  shape=[tf.shape(bbox_target_data)[0], num_classes, 4])
-    """
     weight_updates = tf.multiply(tf.ones_like(tgt_updates), bbox_in_weights)
-    bbox_inside_weights = tf.tensor_scatter_update(
-        tensor=tf.ones([tf.shape(bbox_target_data)[0], num_classes, 4]),
-        indices=clss,
-        updates=weight_updates)
-    """
+    # bbox_inside_weights = tf.tensor_scatter_update(
+    #     tensor=tf.ones([tf.shape(bbox_target_data)[0], num_classes, 4]),
+    #     indices=clss,
+    #     updates=weight_updates)
     bbox_inside_weights = tf.scatter_nd(indices=clss,
                                         updates=weight_updates,
                                         shape=[tf.shape(bbox_target_data)[0], num_classes, 4])
-    """
 
     return bbox_targets, bbox_inside_weights
 
@@ -327,15 +327,13 @@ def generate_proposal_target(rpn_rois, rpn_scores,
 
         keep_indices = tf.concat([fg_indices, bg_indices], axis=0)
         fg_labels = tf.to_int32(tf.gather(labels, indices=fg_indices))
-        labels = tf.tensor_scatter_update(
-            tensor=tf.zeros([rois_per_image], dtype=tf.int32),
-            indices=tf.expand_dims(tf.range(fg_rois_per_image), 1),
-            updates=fg_labels)
-        """
+        # labels = tf.tensor_scatter_update(
+        #     tensor=tf.zeros([rois_per_image], dtype=tf.int32),
+        #     indices=tf.expand_dims(tf.range(fg_rois_per_image), 1),
+        #     updates=fg_labels)
         labels = tf.scatter_nd(indices=tf.expand_dims(tf.range(fg_rois_per_image), 1),
                                updates=fg_labels,
                                shape=[rois_per_image])
-        """
         rois = tf.gather(all_rois, indices=keep_indices)
         roi_scores = tf.gather(all_scores, keep_indices)
         bbox_target_data = _compute_target(

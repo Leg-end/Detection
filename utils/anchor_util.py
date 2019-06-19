@@ -1,6 +1,7 @@
 import tensorflow as tf
 from . import proposal_util
 from collections import namedtuple
+from models.base_model import inject_to_debug_pool
 
 __all__ = ["generate_image_anchors", "generate_anchors", "repeat_tf",
            "generate_anchor_targets",
@@ -21,7 +22,7 @@ is_invoke = False
 def fill_params(rpn_fg_fraction, rpn_batch_size,
                 rpn_in_weights, rpn_positive_weight):
     """
-    Avoiding passing too may hyper parameters,
+    Avoid passing too may hyper parameters,
     store some necessary params in a dict
     This method must be invoked when hyper parameters have constructed
     :param rpn_in_weights: Mask-like factor that only keep positive ones to regression loss calculation
@@ -97,7 +98,7 @@ def _ratio_enum(anchors, ratios):
     m = tf.shape(ratios)[0]
     # Tile each row in anchors m time
     anchors = repeat_tf(anchors, m, axis=0)
-    w, h, ctr_x, ctr_y = get_anchors_info(anchors)
+    ctr_x, ctr_y, w, h = get_anchors_info(anchors)
     size = tf.multiply(w, h)
     # Tile ratios shape(anchors)[0](denoted as n) time
     ratios = tf.tile(tf.expand_dims(ratios, axis=1), [n, 1])
@@ -105,7 +106,7 @@ def _ratio_enum(anchors, ratios):
     size_ratios = tf.divide(size, ratios)
     w = tf.round(tf.sqrt(size_ratios))
     h = tf.round(tf.multiply(w, ratios))
-    anchors = make_anchors(w, h, ctr_x, ctr_y)
+    anchors = make_anchors(ctr_x, ctr_y, w, h)
     return anchors
 
 
@@ -113,31 +114,46 @@ def _scale_enum(anchors, scales):
     n = tf.shape(anchors)[0]
     m = tf.shape(scales)[0]
     anchors = repeat_tf(anchors, m, axis=0)
-    w, h, ctr_x, ctr_y = get_anchors_info(anchors)
+    ctr_x, ctr_y, w, h = get_anchors_info(anchors)
     scales = tf.tile(tf.expand_dims(scales, axis=1), [n, 1])
     w = tf.multiply(w, scales)
     h = tf.multiply(h, scales)
-    return make_anchors(w, h, ctr_x, ctr_y)
+    return make_anchors(ctr_x, ctr_y, w, h)
 
 
 def get_mat_columns(matrix):
     x_l = tf.slice(matrix, [0, 0], [-1, 1])
-    x_r = tf.slice(matrix, [0, 2], [-1, 1])
     y_t = tf.slice(matrix, [0, 1], [-1, 1])
+    x_r = tf.slice(matrix, [0, 2], [-1, 1])
     y_b = tf.slice(matrix, [0, 3], [-1, 1])
     return x_l, y_t, x_r, y_b
 
 
 def get_anchors_info(anchors):
+    """
+    :param anchors: [[xl, yt, xr, yb]]
+    :return: anchors [[ctr_x, ctr_y, widths, heights]]
+    """
     x_l, y_t, x_r, y_b = get_mat_columns(anchors)
     w = tf.subtract(x_r, x_l)
     h = tf.subtract(y_b, y_t)
-    ctr_x = tf.add(x_l, tf.divide(w, 2))
-    ctr_y = tf.add(y_t, tf.divide(h, 2))
-    return tf.add(w, 1), tf.add(h, 1), ctr_x, ctr_y
+    ctr_x = tf.add(x_l, tf.divide(w, 2.))
+    ctr_y = tf.add(y_t, tf.divide(h, 2.))
+    return ctr_x, ctr_y, tf.add(w, 1), tf.add(h, 1)
 
 
-def make_anchors(w, h, ctr_x, ctr_y):
+def get_coco_anchors(anchors):
+    """
+    :param anchors: formed as [x_l, y_t, x_r, y_b]
+    :return: anchors [[x_l, x_r, w, h]]
+    """
+    x_l, y_t, x_r, y_b = get_mat_columns(anchors)
+    w = tf.subtract(x_r, x_l)
+    h = tf.subtract(y_b, y_t)
+    return tf.squeeze(tf.stack([x_l, y_t, tf.add(w, 1.), tf.add(h, 1.)], axis=1))
+
+
+def make_anchors(ctr_x, ctr_y, w, h):
     half_w = tf.divide(tf.subtract(w, 1), 2)
     half_h = tf.divide(tf.subtract(h, 1), 2)
     x_l = tf.subtract(ctr_x, half_w)
@@ -165,6 +181,11 @@ def repeat_tf(matrix, num, axis=0):
     return matrix
 
 # ---------------------------------->target_anchors---------------------------------------
+
+
+# def tensor_scatter_update(tensor, updates, indices):
+#
+#     updates = tf.wher()
 
 
 def random_choice(population, n_samples, axis=0, replace=False, scope=None):
@@ -197,7 +218,16 @@ def random_choice(population, n_samples, axis=0, replace=False, scope=None):
 
         def _swap_dims(tensor, dim_1, dim_2):
             updates = tf.gather(tensor, indices=[dim_1, dim_2])
-            return tf.tensor_scatter_update(tensor, indices=[[dim_2], [dim_1]], updates=updates)
+            cond = tf.scatter_nd(indices=[[dim_1], [dim_2]],
+                                 updates=updates,
+                                 shape=tf.shape(tensor))
+            vules = tf.scatter_nd(indices=[[dim_2], [dim_1]],
+                                  updates=updates,
+                                  shape=tf.shape(tensor))
+            return tf.where(tf.equal(tensor, cond), vules, tensor)
+
+            # tensorflow 1.30
+            # return tf.tensor_scatter_update(tensor, indices=[[dim_2], [dim_1]], updates=updates)
 
         def _fn2(inputs):
             dim_indices = tf.range(
@@ -229,8 +259,8 @@ def _subsample_labels(tensor, size):
 
     indices = tf.slice(tf.where(tf.equal(tensor, 1)), [0, 0], [-1, 1])
     indices = random_choice(indices, size, replace=False)
-    updates = tf.zeros([size, 1], tf.int32)
-    return tf.tensor_scatter_update(tensor, indices, updates)
+    updates = tf.gather(tensor, tf.squeeze(indices))
+    return tf.scatter_nd(indices=indices, updates=updates, shape=tf.cast(tf.shape(tensor), dtype=tf.int64))
 
 
 def _generate_positives_negatives(boxes_overlaps, index_masks,
@@ -255,21 +285,21 @@ def _generate_positives_negatives(boxes_overlaps, index_masks,
         max_mask_positives = tf.cast(tf.cast(
                         tf.multiply(tf.reduce_sum(mat_mask, 0), index_masks), tf.bool), tf.int32)
 
-        negatives = tf.multiply(tf.cast(tf.less(max_overlaps, 0.6), tf.int32), index_masks)
+        negatives = tf.multiply(tf.cast(tf.less(max_overlaps, 0.3), tf.int32), index_masks)
         valid_max_mask = tf.cast(tf.greater(tf.subtract(max_mask_positives, negatives), 0), tf.int32)
 
         positives = tf.maximum(valid_max_mask,
-                               tf.cast(tf.greater_equal(max_overlaps, 0.8), tf.int32))
+                               tf.cast(tf.greater_equal(max_overlaps, 0.6), tf.int32))
 
         allow_num_fg = tf.cast(rpn_fg_fraction * rpn_batch_size, tf.int32)
         num_fg = tf.reduce_sum(positives)
         positives = tf.cond(tf.greater(num_fg, allow_num_fg),
-                            fn1=lambda: _subsample_labels(positives, num_fg-allow_num_fg), fn2=lambda: positives)
+                            fn1=lambda: _subsample_labels(positives, allow_num_fg), fn2=lambda: positives)
 
         allow_num_bg = tf.cast(rpn_batch_size, tf.int32)
         num_bg = tf.reduce_sum(negatives)
         negatives = tf.cond(tf.greater(num_bg, allow_num_bg),
-                            fn1=lambda: _subsample_labels(negatives, num_bg-allow_num_bg), fn2=lambda: negatives)
+                            fn1=lambda: _subsample_labels(negatives, allow_num_bg), fn2=lambda: negatives)
 
         label_negatives = tf.subtract(negatives, 1)
         label_positives = tf.subtract(tf.multiply(positives, 2), 1)
@@ -286,7 +316,7 @@ def generate_anchor_targets(rpn_cls_score, all_anchors, target_boxes,
                             image_info, num_anchors, scope=None):
     """
         :param all_anchors: is shape of [M, 4]
-        :param target_boxes: is shape of [N, 4]
+        :param target_boxes: is shape of [N, 5]
         :param image_info:  is shape of [3,]
         :param num_anchors: is
         :param scope: name scope
@@ -303,18 +333,19 @@ def generate_anchor_targets(rpn_cls_score, all_anchors, target_boxes,
                     tf.greater_equal(tf.slice(all_anchors, [0, 1], [-1, 1]), allow_border) &
                     tf.less(tf.slice(all_anchors, [0, 2], [-1, 1]), tf.add(image_info[1], allow_border)) &
                     tf.less(tf.slice(all_anchors, [0, 3], [-1, 1]), tf.add(image_info[0], allow_border)))
-
         mask_anchors = tf.multiply(all_anchors, tf.cast(index_masks, tf.float32))
         boxes_overlaps = proposal_util.boxes_iou(mask_anchors, target_boxes[:, :-1])
-
+        # inject_to_debug_pool(target_boxes=target_boxes)
         labels, mask_positive_anchors, mask_negative_anchors, max_0 = _generate_positives_negatives(
             boxes_overlaps, tf.cast(index_masks, tf.int32),
             params.rpn_fg_fraction, params.rpn_batch_size, scope=scope)
-
+        inject_to_debug_pool(anchor_util_mask_negative_anchors=tf.where(tf.not_equal(mask_negative_anchors, 0.0)))
+        inject_to_debug_pool(anchor_util_mask_bool=tf.where(tf.equal(labels, 1)))
+        # inject_to_debug_pool(anchor_util_all_anchors=all_anchors)
         bbox_targets = tf.where(tf.equal(tf.squeeze(mask_positive_anchors), 0.0),
                                 tf.zeros_like(mask_anchors),
                                 _compute_bbox_targets(mask_anchors, tf.gather_nd(target_boxes, max_0)[:, :-1]))
-
+        inject_to_debug_pool(anchor_util_bbox_target=bbox_targets)
         bbox_inside_weights = tf.multiply(mask_positive_anchors,
                                           tf.constant(params.rpn_in_weights, tf.float32))
         rpn_positive_weight = params.rpn_positive_weight

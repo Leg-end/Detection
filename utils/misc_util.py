@@ -10,6 +10,9 @@ from tensorlib.training import HParams
 import PIL.Image as Image
 import PIL.ImageDraw as ImageDraw
 import PIL.ImageFont as ImageFont
+import datetime
+from matplotlib import pyplot as plt
+from matplotlib import patches
 
 
 STANDARD_COLORS = [
@@ -42,7 +45,7 @@ NUM_COLORS = len(STANDARD_COLORS)
 
 
 try:
-    FONT = ImageFont.truetype('arial.ttf', 24)
+    FONT = ImageFont.truetype('arial.ttf', 12)
 except IOError:
     FONT = ImageFont.load_default()
 
@@ -133,15 +136,14 @@ def debug_tensor(s, msg=None, summarize=10):
     return tf.Print(s, [tf.shape(s), s], msg + " ", summarize=summarize)
 
 
-def back_to_rgb(image, pixel_means, im_info):
-    image += pixel_means
+def back_to_rgb(image, im_info):
     image = tf.image.resize_bilinear(image, tf.to_int32(im_info[:2] / im_info[2]))
     return tf.reverse(image, axis=[-1])
 
 
-def _draw_box_on_image(image, xmin, ymin, xmax, ymax, display_str, font, color='black', thickness=4):
+def _draw_box_on_image(image, xl, yb, xr, yt, display_str, font, color='black', thickness=4, draw_text=False):
     draw = ImageDraw.Draw(image)
-    (left, right, top, bottom) = (xmin, xmax, ymin, ymax)
+    (left, right, top, bottom) = (xl, xr, yt, yb)
     draw.line([(left, top), (left, bottom), (right, bottom),
                (right, top), (left, top)], width=thickness, fill=color)
     text_bottom = bottom
@@ -151,32 +153,53 @@ def _draw_box_on_image(image, xmin, ymin, xmax, ymax, display_str, font, color='
     draw.rectangle(
         [(left, text_bottom - text_height - 2 * margin),
          (left + text_width, text_bottom)], fill=color)
-    draw.text(
-        (left + margin, text_bottom - text_height - margin),
-        display_str, fill='black', font=font)
+    if draw_text:
+        draw.text(
+            (left + margin, text_bottom - text_height - margin),
+            display_str, fill='black', font=font)
     return image
 
 
-def draw_boxes_on_image(image, bboxes, prob, category, im_info,
-                        bgr=False, pixel_means=None):
+def draw_boxes_on_image(image, tgt_bboxes, prob, im_info, pixel_means,
+                        categories, categories_id=None,
+                        bgr=False):
+    image += pixel_means
     if bgr:
-        image = back_to_rgb(image, pixel_means, im_info)
-    num_boxes = bboxes.shape[0]
-    gt_boxes_new = bboxes.copy()
+        image = back_to_rgb(image, im_info)
+    num_boxes = tgt_bboxes.shape[0]
+    gt_boxes_new = tgt_bboxes.copy()
+    if tgt_bboxes.shape[1] == 5:
+        categories_id = tgt_bboxes[:, 4]
     gt_boxes_new[:, :4] = np.round(gt_boxes_new[:, :4].copy() / im_info[2])
     disp_image = Image.fromarray(np.uint8(image[0]))
     for i in range(num_boxes):
-        this_class = int(gt_boxes_new[i, 4])
+        category_name = categories[i]
+        category_id = int(categories_id[i])
         disp_image = _draw_box_on_image(disp_image,
                                         gt_boxes_new[i, 0],
                                         gt_boxes_new[i, 1],
                                         gt_boxes_new[i, 2],
                                         gt_boxes_new[i, 3],
-                                        'N%02d-C%s-P%02d' % (i, category, prob),
+                                        'N%02d-C%s-P%.2f' % (i, category_name, prob[i]),
                                         FONT,
-                                        color=STANDARD_COLORS[this_class % NUM_COLORS])
-        image[0, :] = np.array(disp_image)
+                                        color=STANDARD_COLORS[category_id % NUM_COLORS])
+        image[0, :] = np.asarray(disp_image)
     return image
+
+
+def draw_detect_results(detect_results):
+    for result in detect_results:
+        # Create figure and axes
+        fig, ax = plt.subplots(1)
+        # Display the image
+        ax.imshow(result.images)
+        # Create a Rectangle patch
+        print("Bounding boxes:", result.bboxes)
+        for bbox in result.bboxes:
+            rect = patches.Rectangle((bbox[0], bbox[1]), bbox[2], bbox[3],
+                                     linewidth=2, edgecolor='r', facecolor='none')
+            ax.add_patch(rect)
+        plt.show()
 
 
 def get_config_proto(log_device_placement=False,
@@ -188,7 +211,7 @@ def get_config_proto(log_device_placement=False,
         log_device_placement=log_device_placement,
         allow_soft_placement=allow_soft_placement)
     config_proto.gpu_options.allow_growth = True
-    config_proto.gpu_options.per_process_gpu_memory_fraction = 0.5
+    config_proto.gpu_options.per_process_gpu_memory_fraction = 0.1
 
     # CPU threads options
     if num_intra_threads:
@@ -197,6 +220,25 @@ def get_config_proto(log_device_placement=False,
             config_proto.inter_op_parallelism_threads = num_inter_threads
 
     return config_proto
+
+
+def write_to_file(title, context):
+    file = "D:/Detection/log/exe_log.txt"
+    np.savetxt(file, context)
+    now_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    context = ''.join(["|\n", now_time, ":DEBUG-", title])
+    print(context)
+    with codecs.getwriter("utf-8")(
+            tf.gfile.GFile(file, mode="a")) as debug_f:
+        debug_f.write(context)
+
+
+def cal_trainable_param_count():
+    tf.logging.info('Total: {} params'.format(
+        np.sum([
+            np.prod(v.get_shape().as_list())
+            for v in tf.trainable_variables()
+        ])))
 
 
 def mean_avg_overlap(bbox_labels, bbox_infer):

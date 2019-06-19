@@ -2,7 +2,7 @@ import os
 import tensorflow as tf
 import time
 import numpy as np
-from utils import anchor_util
+from utils import anchor_util, misc_util
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 
@@ -16,7 +16,7 @@ def test_image_anchors():
     height = tf.to_int32(tf.ceil(tf.divide(tf.to_float(480), tf.to_float(16))))
     width = tf.to_int32(tf.ceil(tf.divide(tf.to_float(640), tf.to_float(16))))
     # anchors, num = anchor_util.generate_image_anchors(height, width)
-    anchors, num = generate_anchors_pre_tf(height, width)
+    anchors, num = anchor_util.generate_image_anchors(height, width)
     with tf.Session() as sess:
         print(sess.run([anchors, num]))
 
@@ -57,12 +57,46 @@ def generate_anchors_pre_tf(height, width, feat_stride=16, anchor_scales=(8, 16,
     return tf.cast(anchors_tf, dtype=tf.float32), length
 
 
+def debug_anchor_nan():
+    base_size = 16
+    ratios = tf.constant([0.5, 1.0, 2.0])
+    scales = tf.multiply(tf.range(3, 6), 2)
+    base_anchor = tf.subtract(tf.constant([1.0, 1.0, base_size, base_size]), 1.0)
+    ratio_anchors, ctr_x, ctr_y, w, h = ratio_enum(tf.expand_dims(base_anchor, axis=0), ratios)
+    with tf.Session() as sess:
+        print(sess.run([ratio_anchors, ctr_x, ctr_y, w, h]))
+
+
+def ratio_enum(anchors, ratios):
+    # Each ratios corresponds to each row in anchors that copy three times
+    # So we need record anchors' total count before repeat it
+    n = tf.shape(anchors)[0]
+    m = tf.shape(ratios)[0]
+    # Tile each row in anchors m time
+    anchors = anchor_util.repeat_tf(anchors, m, axis=0)
+
+    ctr_x, ctr_y, w, h = anchor_util.get_anchors_info(anchors)
+    size = tf.multiply(w, h)
+    # Tile ratios shape(anchors)[0](denoted as n) time
+    ratios = tf.tile(tf.expand_dims(ratios, axis=1), [n, 1])
+    # Then we have size as m*n X 1, ratios as m*n X 1, they can divide between each row directly
+    size_ratios = tf.divide(size, ratios)
+    w = tf.round(tf.sqrt(size_ratios))
+    h = tf.round(tf.multiply(w, ratios))
+    anchors = anchor_util.make_anchors(ctr_x, ctr_y, w, h)
+    return anchors, ctr_x, ctr_y, w, h
+
+
 if __name__ == "__main__":
     t = time.time()
-    test_image_anchors()
+    # a = dict()
+    # misc_util.append_param(a, b=1)
+    # test_image_anchors()
+    debug_anchor_nan()
     # test_scale()
     # test_scale()
     # test_target_anchors()
+    # print(a)
     print(time.time()-t)
     # a = tf.expand_dims(tf.reshape(tf.range(20), shape=[5, 4]), dim=0)
     # a = tf.tile(a, multiples=[2, 1, 1])
