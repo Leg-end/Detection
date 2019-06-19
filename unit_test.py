@@ -52,10 +52,28 @@ def test():
     helper.print_variables_in_ckpt("D:/Detection/pre_ckpt/vgg_16.ckpt")
 
 
+def test_swap():
+    a = tf.reshape(tf.range(16), shape=[4, 4])
+    data = tf.data.Dataset()
+    data = data.from_tensor_slices(a)
+    iterator = data.make_one_shot_iterator()
+    item = iterator.get_next()
+    shape = tf.shape(item)
+    dim1 = 1
+    dim2 = 3
+    indices = tf.range(shape)
+
+    indices = tf.constant([[2], [1], [0], [3]])
+    shape = tf.constant([4])
+    scatter = tf.scatter_nd(indices=indices, shape=shape, updates=item)
+    with tf.Session() as sess:
+        print(sess.run(scatter))
+
+
 if __name__ == "__main__":
     t = time.time()
     # test_eval_mAP()
     # test_hparams()
     # test_generate_img_anchors()
-    test()
+    test_swap()
     print(time.time() - t)

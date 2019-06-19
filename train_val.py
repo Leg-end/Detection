@@ -53,10 +53,11 @@ def process_stats(stats, info, steps_per_stats, batch_size):
     info["avg_step_time"] = stats["step_time"] / steps_per_stats
     info["avg_grad_norm"] = stats["grad_norm"] / steps_per_stats
     info["avg_train_loss"] = stats["train_loss"] / batch_size
+    # todo calculate speed fps/s
 
 
 def update_stats(stats, start_time, step_result):
-    _, output_tuple = step_result
+    output_tuple = step_result
     assert isinstance(output_tuple, base_model.TrainOutputTuple)
     batch_size = output_tuple.batch_size
     stats["step_time"] += time.time() - start_time
@@ -71,7 +72,7 @@ def print_step_info(global_step, info, stats):
     tf.logging.info(
         "In step %d, total_train_loss %.2f, avg-train-loss %.2f, learning rate %g,"
         " avg-step-time %.2fs, avg-grad-norm %.2f, speed %.2f, %s" %
-        (global_step, stats["train_loss"], info["avg-train_loss"], info["learning_rate"],
+        (global_step, stats["train_loss"], info["avg_train_loss"], info["learning_rate"],
          info["avg_step_time"], info["avg_grad_norm"], info["speed"], time.ctime()))
 
 
@@ -98,7 +99,7 @@ def train(hparams, ckpt_dir, scope=None, target_session="", alternative=False):
     tf.logging.info("Create model successfully")
     with train_model.graph.as_default():
         loaded_train_model, global_step = helper.create_or_load_model(
-            train_model.model, ckpt_dir, train_sess, "train")
+            train_model.model, ckpt_dir, train_sess, train_model.model.restore_op)
     # Summary writer
     summary_name = "train_summary"
     summary_path = os.path.join(out_dir, summary_name)
@@ -112,11 +113,14 @@ def train(hparams, ckpt_dir, scope=None, target_session="", alternative=False):
         loaded_train_model, train_model, train_sess, global_step)
     tf.logging.info("Ready to train")
     epoch_step = 0
+    num_train_steps += global_step
+    detect_results = []
     while global_step < num_train_steps:
         start_time = time.time()
         try:
             tf.logging.info("Start train epoch:%d" % epoch_step)
-            step_result = loaded_train_model.train(train_sess)
+            _, step_result, detect_result = loaded_train_model.train(train_sess)
+            detect_results.append(detect_result)
             epoch_step += 1
         except tf.errors.OutOfRangeError:
             tf.logging.info("Saving epoch step %d model into checkpoint" % epoch_step)
@@ -151,7 +155,6 @@ def train(hparams, ckpt_dir, scope=None, target_session="", alternative=False):
             print_step_info(global_step, info, stats)
             # Reset statistic
             stats = init_stats()
-
     # Done training
     tf.logging.info("Finish training, saving model into checkpoint")
     loaded_train_model.saver.save(
@@ -159,3 +162,4 @@ def train(hparams, ckpt_dir, scope=None, target_session="", alternative=False):
         ckpt_path,
         global_step=global_step)
     summary_writer.close()
+    misc.draw_detect_results(detect_results)

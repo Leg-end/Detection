@@ -2,6 +2,7 @@ import argparse
 import utils.misc_util as misc
 import train_val
 import inference
+import eval
 import tensorflow as tf
 import random
 import os
@@ -51,7 +52,7 @@ def add_arguments(parser):
                         help="Scale list for changing anchor's scale")
     parser.add_argument("--rpn_fg_fraction", type=float, default=0.5,
                         help="Max number of foreground examples")
-    parser.add_argument("--rpn_batch_size", type=int, default=128,  # 256
+    parser.add_argument("--rpn_batch_size", type=int, default=64,  # 256
                         help="Total number of examples")
     parser.add_argument("--fg_thresh", type=float, default=0.5,
                         help="Overlap threshold for a ROI to be considered foreground (if >= FG_THRESH)")
@@ -87,7 +88,7 @@ def add_arguments(parser):
                         help="Initial weight for regression trainable variables")
 
     # Training config
-    parser.add_argument("--num_train_steps", type=int, default=1000,
+    parser.add_argument("--num_train_steps", type=int, default=400,
                         help="Total train steps")
     parser.add_argument("--momentum_factor", type=float, default=0.9,
                         help="Factor use for momentum optimizer")
@@ -95,7 +96,7 @@ def add_arguments(parser):
                         help="Whether to fine tune")
     parser.add_argument("--max_grad_norm", type=int, default=5,
                         help="Limitation value of max gradient")
-    parser.add_argument("--steps_per_stats", type=int, default=50,
+    parser.add_argument("--steps_per_stats", type=int, default=20,
                         help="Count of step for each states printing when training")
     parser.add_argument("--warmup_steps", type=int, default=10,
                         help="Number of Step for warm up strategy in learning_rate")
@@ -103,7 +104,7 @@ def add_arguments(parser):
                         help="Scheme of warm up strategy")
     parser.add_argument("--tune_rate", type=float, default=0.0001,
                         help="Learning rate of fine tune")
-    parser.add_argument("--learning_rate", type=float, default=0.01,
+    parser.add_argument("--learning_rate", type=float, default=0.001,
                         help="Learning rate without fine tune")
     parser.add_argument("--decay_scheme", choices=["luong5", "luong10", "luong234", ""],
                         help="Scheme of learning rate decay")
@@ -120,7 +121,7 @@ def add_arguments(parser):
                         help="Whether to do bias decay using weight decay factor")
 
     # Net Structure
-    parser.add_argument("--rpn_channel", type=int, default=128,   # 512
+    parser.add_argument("--rpn_channel", type=int, default=64,   # 512
                         help="Number of kernel for first convolution layer in rpn")
     parser.add_argument("--pooling_mode", default="crop", choices=["pyramid", "crop"],
                         help="The strategy for pooling rois")
@@ -154,7 +155,7 @@ def add_arguments(parser):
                         help="Thread number configuration for session")
     parser.add_argument("--num_inter_threads", type=int, default=0,
                         help="Thread number configuration for session")
-    parser.add_argument("--log_device_placement", type="bool", nargs="?", const=True, default=True,
+    parser.add_argument("--log_device_placement", type="bool", nargs="?", const=False, default=False,
                         help="Whether to log device placement")
     parser.add_argument("--feat_stride", type=int, default=16,
                         help="The length of side of region for sampling roi in image")
@@ -304,7 +305,7 @@ def pre_fill_params_into_utils(hparams):
                               use_tgt=hparams.use_tgt)
 
 
-def run_main(hparams, train_func, infer_func, target_session=""):
+def run_main(hparams, train_func, infer_func, eval_func, target_session=""):
     # GPU device
     print("Devices visible to Tensorflow: %s" % repr(tf.Session().list_devices()))
 
@@ -341,9 +342,14 @@ def run_main(hparams, train_func, infer_func, target_session=""):
     else:
         hparams.flatten = False
     if hparams.mode == "train":
+        tf.logging.info("Execute training")
         train_func(hparams, ckpt_dir, target_session=target_session)
     elif hparams.mode == "infer":
+        tf.logging.info("Execute inference")
         infer_func(hparams, ckpt_dir, target_session=target_session)
+    elif hparams.mode == "eval":
+        tf.logging.info("Execute evaluating")
+        eval_func(hparams, ckpt_path=ckpt_dir, target_session=target_session)
 
 
 if __name__ == "__main__":
@@ -354,4 +360,5 @@ if __name__ == "__main__":
     def_hparams = create_hparams(flags)
     train_fn = train_val.train
     infer_fn = inference.infer
-    run_main(def_hparams, train_fn, infer_fn)
+    eval_fn = eval.evaluate
+    run_main(def_hparams, train_fn, infer_fn, eval_fn)

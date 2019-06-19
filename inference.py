@@ -3,22 +3,24 @@ import model_helper as helper
 from utils import misc_util as misc
 import os
 import time
-from matplotlib import pyplot as plt
+import numpy as np
+from PIL import Image
 
 
 tf.logging.set_verbosity(tf.logging.INFO)
 
 
 def get_model_creator(model_type):
-    from models.vgg16 import VGG16
+    # from models.vgg16 import VGG16
     from models.inception_v3 import InceptionV3
     from models.vgg_16 import VGG16B
-    if model_type == "VGG16":
-        return VGG16
-    elif model_type == "VGG_16":
+    from models.resnet_v1 import ResNetV1
+    if model_type == "VGG_16":
         return VGG16B
     elif model_type == "InceptionV3":
         return InceptionV3
+    elif model_type == "ResNetV1":
+        return ResNetV1
 
 
 def start_sess_and_load_model(infer_model, ckpt_dir):
@@ -50,15 +52,18 @@ def infer(hparams, ckpt_dir, scope=None, target_session=""):
     tf.logging.info("Ready to infer")
     start_time = time.time()
     step = 0
-    while True:
-        try:
-            tf.logging.info("Start infer step:%d" % step)
-            results = loaded_infer_model.infer(infer_sess)
-            summary_writer.add_summary(results.summary, global_step)
-            infer_results.append(results.detected_images)
-            step += 1
-        except tf.errors.OutOfRangeError:
-            tf.logging.info("Finish infer <time:%d>" % (start_time-time.time()))
-            break
-    for result in infer_results:
-        plt.show(result)
+    detect_results = list()
+    dataset_dir = os.path.join(hparams.data_dir, "test")
+    filenames = tf.gfile.ListDirectory(dataset_dir)
+    for filename in filenames:
+        im = Image.open(os.path.join(dataset_dir, filename))
+        image_feed = np.expand_dims(np.asarray(im, dtype='float32'), axis=0)
+        size_feed = np.asarray([im.size[0], im.size[1], 3], dtype='int32')
+        tf.logging.info("Start infer step:%d" % step)
+        step_result, detect_result = loaded_infer_model.infer(infer_sess, image_feed=image_feed, size_feed=size_feed)
+        summary_writer.add_summary(step_result.summary, global_step)
+        infer_results.append(step_result.bboxes)
+        detect_results.append(detect_result)
+        step += 1
+    tf.logging.info("Finish infer <spend time:%d>" % (time.time() - start_time))
+    misc.draw_detect_results(detect_results)

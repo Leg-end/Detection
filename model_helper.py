@@ -12,6 +12,7 @@ from utils import proposal_util
 from utils import anchor_util
 from utils import misc_util as misc
 from dataset import iterator_wrapper
+from models import base_model
 
 
 __all__ = ["get_initializer", "get_device_str", "generate_img_anchors",
@@ -96,8 +97,7 @@ def reshape_for_forward_pairs(inputs, num_dim, name="reshape_forward_pairs"):
         shape = tf.shape(inputs)
         outputs = tf.transpose(inputs, perm=[0, 3, 1, 2])
         # Force it to have 2 channels
-        outputs = tf.reshape(outputs, shape=tf.concat(
-            values=[[1, num_dim, -1], [shape[2]]], axis=0))
+        outputs = tf.reshape(outputs, shape=[1, num_dim, -1, shape[2]])
         # Switch it back
         outputs = tf.transpose(outputs, perm=[0, 2, 3, 1])
     return outputs
@@ -110,9 +110,9 @@ def sample_rois_from_anchors(cls_scores,
                              count,
                              name="sample_rois"):
     with tf.name_scope(name):
-        rois, scores = proposal_util.sample_regions(cls_scores, bbox_deltas, im_info,
-                                                    anchors, count)
-    return rois, scores
+        rois, scores, deltas = proposal_util.sample_regions(
+            cls_scores, bbox_deltas, im_info, anchors, count)
+    return rois, scores, deltas
 
 
 def pack_anchor_info(im_info,
@@ -215,7 +215,7 @@ def crop_resize_pooling(inputs, rois, feat_stride, pool_size,
     if max_pool:
         pool_size = pool_size*2
         crops = tf.image.crop_and_resize(inputs, bboxes, tf.to_int32(batch_inds),
-                                        [pool_size, pool_size], name="crops")
+                                         [pool_size, pool_size], name="crops")
         crops = tf.nn.max_pool(crops, ksize=[1, 2, 2, 1], strides=[1, 1, 1, 1],
                                padding=padding, name="max_pool")
     else:
@@ -266,31 +266,42 @@ class InferModel(collections.namedtuple("InferModel",
 def create_infer_model(model_creator,
                        hparams,
                        scope=None):
-    dataset_dir = os.path.join(hparams.data_dir, "eval")
-    filenames = tf.gfile.ListDirectory(dataset_dir)
-    images = []
-    for i in range(len(filenames)):
-        filenames[i] = os.path.join(dataset_dir, filenames[i])
-        with tf.gfile.GFile(filenames[i], "rb") as f:
-            images.append(f.read())
+    """
+    :param model_creator: Model entity
+    :param hparams: hyper parameter
+    :param scope: scope
+    :return:
+    """
+    # dataset_dir = os.path.join(hparams.data_dir, "test")
+    # filenames = tf.gfile.ListDirectory(dataset_dir)
+    # images = []
+    # im_info = []
+    # for i in range(len(filenames)):
+    #     filenames[i] = os.path.join(dataset_dir, filenames[i])
+    #     img = Image.open(filenames[i])
+    #     img_data = np.asarray(img, dtype='float32')
+    #     images.append(tf.constant(img_data))
+    #     im_info.append(tf.constant([img.size[0], img.size[1], 3]))
     graph = tf.Graph()
-    with graph.as_default(), tf.container(scope or "eval"):
+    with graph.as_default(), tf.container(scope or "infer"):
         with tf.name_scope("Data"):
             with tf.device("/cpu:0"):
                 reverse_cate_table = misc.create_reverse_category_table(hparams.category_file)
-                raw_dataset = tf.data.Dataset()
-                raw_dataset = raw_dataset.from_tensor_slices(images)
-                data_wrapper = iterator_wrapper.get_infer_iterator_wrapper(
-                    raw_dataset, hparams.img_batch_size)
+                # img_dataset = tf.data.Dataset()
+                # size_dataset = tf.data.Dataset()
+                # img_dataset = img_dataset.from_tensor_slices(images)
+                # size_dataset = size_dataset.from_tensor_slices(im_info)
+                # data_wrapper = iterator_wrapper.get_infer_iterator_wrapper(
+                #     img_dataset, size_dataset, hparams.img_batch_size)
         model = model_creator(
             hparams=hparams,
             reverse_cate_table=reverse_cate_table,
-            data_wrapper=data_wrapper,
+            data_wrapper=None,
             scope=scope)
         return InferModel(
             graph=graph,
             model=model,
-            data_wrapper=data_wrapper)
+            data_wrapper=None)
 
 
 class EvalModel(collections.namedtuple("EvalModel",
@@ -374,12 +385,12 @@ def load_model(model,
     ckpt = tf.train.get_checkpoint_state(
         os.path.dirname(ckpt_path))
     if ckpt and ckpt.model_checkpoint_path:
-        if init_op:
-            print("Restore a pre-trained model")
-            init_op(session)
         model.saver.restore(session, ckpt.model_checkpoint_path)
     else:
         print("Can't load checkpoint")
+        if init_op is not None:
+            print("Restore a pre-trained model")
+            init_op(session)
     print(
         "  loaded %s model parameters from %s, time %.2fs" %
         (name, ckpt_path, time.time() - start_time))
@@ -395,10 +406,13 @@ def create_or_load_model(model,
         model = load_model(model, latest_ckpt, session, init_op, "restore")
     else:
         start_time = time.time()
-        session.run(tf.global_variables_initializer())
-        session.run(tf.tables_initializer())
         print("  created %s model with fresh parameters, time %.2fs" %
               (model.scope, time.time() - start_time))
+        if init_op is not None:
+            print("Restore a pre-trained model")
+            init_op(session)
+    session.run(tf.global_variables_initializer())
+    session.run(tf.tables_initializer())
     global_step = model.global_step.eval(session=session)
     print("global_step=%d" % global_step)
     return model, global_step
